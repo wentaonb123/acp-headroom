@@ -125,8 +125,9 @@ describe("acp-headroom-opencode plugin", () => {
 		const { hooks } = ctx;
 		const output = { system: ["base"] } as any;
 		await (hooks as any)["experimental.chat.system.transform"]({}, output);
-		assert.equal(output.system.length, 4); // base + 3 instruction lines
+		assert.equal(output.system.length, 5); // base + 4 instruction lines
 		assert.ok(output.system.some((l: string) => l.includes("headroom_retrieve")));
+		assert.ok(output.system.some((l: string) => l.includes("Compress proactively")));
 	});
 
 	it("headroom_retrieve fails open with a friendly message", async () => {

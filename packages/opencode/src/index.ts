@@ -90,6 +90,8 @@ const SYSTEM_LINES = [
 	"Large tool results may be mechanically compressed into short summaries carrying CCR retrieval hashes (marker formats: 'Retrieve more: hash=<hex>' or 'Retrieve original: hash=<hex>').",
 	"When you need the exact full content of a compressed result, call headroom_retrieve with the hex hash from its marker.",
 	"To find something you only vaguely remember from an older tool output, call headroom_search with keywords instead of guessing hashes.",
+	// Proactive compression teaching (pi's WHEN TO COMPRESS, condensed):
+	"Compress proactively regardless of context size: once you have extracted the key facts from a large tool result (build/test logs, diffs, directory listings, research output), call headroom_compress on that text and reference its marker instead of echoing the bulk into your reply.",
 ];
 
 const COMPACTION_LINES = [
