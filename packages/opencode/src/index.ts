@@ -322,33 +322,57 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 		tool: {
 			acp_compress: tool({
 				description:
-					"Compress a contiguous range of OLDER conversation messages into one summary you write. Reference messages by their [mN] tags (from/to inclusive). Use when the whole range is consumed — finished explorations, resolved threads, completed phases. Never include the current working set or verbatim-critical user instructions.",
+					"Compress contiguous ranges of OLDER conversation messages into summaries you write. Reference messages by their [mN] tags (from/to inclusive). Pass `ranges` to fold several consumed stretches in ONE call (saves intermediate inference rounds), or the single from/to/summary form. Use when a whole stretch is consumed — finished explorations, resolved threads, completed phases. Never include the current working set or verbatim-critical user instructions.",
 				args: {
-					from: tool.schema.string().describe("First ref in the range, e.g. \"m12\""),
-					to: tool.schema.string().describe("Last ref in the range (inclusive), e.g. \"m40\""),
-					summary: tool.schema.string().describe("Your detailed summary preserving decisions, constraints, outcomes and open questions"),
+					ranges: tool.schema
+						.array(
+							tool.schema.object({
+								from: tool.schema.string().describe("First ref in the range, e.g. \"m12\""),
+								to: tool.schema.string().describe("Last ref in the range (inclusive)"),
+								summary: tool.schema.string().describe("Your detailed summary preserving decisions, constraints, outcomes and open questions"),
+							}),
+						)
+						.optional()
+						.describe("Batch mode: fold multiple ranges in one call; stops at the first invalid range"),
+					from: tool.schema.string().optional().describe('Single-range mode: first ref, e.g. "m12"'),
+					to: tool.schema.string().optional().describe("Single-range mode: last ref (inclusive)"),
+					summary: tool.schema.string().optional().describe("Single-range mode: your summary"),
 				},
 				async execute(args) {
 					const parse = (s: string) => {
 						const m = /^m(\d+)$/i.exec(s.trim());
 						return m ? Number(m[1]) : null;
 					};
-					const start = parse(args.from);
-					const end = parse(args.to);
-					if (start === null || end === null || start < 1 || end < start) {
-						return `Invalid range "${args.from}..${args.to}". Use [mN] tags, from <= to.`;
+					const batch =
+						args.ranges ??
+						(args.from !== undefined || args.to !== undefined || args.summary !== undefined
+							? [{ from: args.from!, to: args.to!, summary: args.summary! }]
+							: []);
+					if (batch.length === 0) {
+						return 'Nothing to fold. Provide ranges:[{from,to,summary},...] or from/to/summary.';
 					}
-					if (end >= acpState.nextRef) {
-						return `Unknown refs: tags only go up to m${acpState.nextRef - 1}.`;
+					const results: string[] = [];
+					for (const r of batch) {
+						const start = parse(r.from);
+						const end = parse(r.to);
+						if (start === null || end === null || start < 1 || end < start) {
+							results.push(`✗ "${r.from}..${r.to}": invalid range (use [mN] tags, from <= to); earlier folds in this call stand.`);
+							break;
+						}
+						if (end >= acpState.nextRef) {
+							results.push(`✗ "${r.from}..${r.to}": unknown refs (tags only go up to m${acpState.nextRef - 1}); earlier folds in this call stand.`);
+							break;
+						}
+						let count = 0;
+						for (const ref of acpState.refByInfo.values()) {
+							if (ref >= start && ref <= end) count++;
+						}
+						acpState.ranges.push({ start, end, summary: r.summary });
+						results.push(`✓ ${r.from}..${r.to} folded (${count} messages)`);
 					}
-					let count = 0;
-					for (const ref of acpState.refByInfo.values()) {
-						if (ref >= start && ref <= end) count++;
-					}
-					acpState.ranges.push({ start, end, summary: args.summary });
 					// Natural distillation: folding a range that overlaps earlier
 					// ranges swallows them — no explicit tier machinery needed.
-					return `Range ${args.from}..${args.to} folded (${count} messages). The summary replaces it in subsequent context; earlier overlapping folds are absorbed.`;
+					return `${results.join("\n")}\nSummaries replace their ranges in subsequent context; overlapping folds are absorbed.`;
 				},
 			}),
 

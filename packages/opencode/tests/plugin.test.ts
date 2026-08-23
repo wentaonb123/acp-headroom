@@ -252,6 +252,34 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(status, /acp ranges folded: 1/);
 	});
 
+	it("acp_compress batch mode folds several ranges in one call", async () => {
+		const { hooks } = ctx;
+		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });
+		const output = {
+			messages: [
+				mk("b1"), mk("b2"), mk("b3"), mk("b4"),
+				{ info: { role: "user" }, parts: [] },
+			],
+		} as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		const refOf = (i: number) => Number(/\[m(\d+)\]/.exec(output.messages[i].parts[0].text)![1]);
+		const r1 = refOf(0), r4 = refOf(3);
+
+		const result = await (hooks as any).tool.acp_compress.execute({
+			ranges: [
+				{ from: `m${r1}`, to: `m${r1 + 1}`, summary: "First consumed stretch." },
+				{ from: `m${r4}`, to: `m${r4 + 500}`, summary: "Should fail - out of bounds." },
+				{ from: `m${r4}`, to: `m${r4}`, summary: "Never reached." },
+			],
+		});
+		assert.match(result, /✓ m\d+\.\.m\d+ folded \(2 messages\)/);
+		assert.match(result, /✗/); // second range failed, third never ran
+		assert.match(result, /earlier folds in this call stand/);
+
+		const status = await (hooks as any).tool.headroom_status.execute({});
+		assert.match(status, /acp ranges folded: [2-9]/); // prior test's fold + these two
+	});
+
 	it("fires a toast only when the pressure tier changes", async () => {
 		const { hooks, toasts } = ctx;
 		const before = toasts.length;

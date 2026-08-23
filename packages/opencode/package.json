@@ -1,6 +1,6 @@
 {
 	"name": "acp-headroom-opencode",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Headroom tool-output compression for OpenCode — compresses oversized tool results via a local Headroom proxy and lets the model retrieve originals back by hash.",
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
