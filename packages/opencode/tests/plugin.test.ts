@@ -125,7 +125,7 @@ describe("acp-headroom-opencode plugin", () => {
 		const { hooks } = ctx;
 		const output = { system: ["base"] } as any;
 		await (hooks as any)["experimental.chat.system.transform"]({}, output);
-		assert.equal(output.system.length, 5); // base + 4 instruction lines
+		assert.equal(output.system.length, 6); // base + 5 instruction lines
 		assert.ok(output.system.some((l: string) => l.includes("headroom_retrieve")));
 		assert.ok(output.system.some((l: string) => l.includes("Compress proactively")));
 	});
@@ -222,6 +222,36 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(status, /user msgs\s+\d/);
 	});
 
+	it("injects [mN] refs, folds ranges via acp_compress", async () => {
+		const { hooks } = ctx;
+		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });
+		const output = {
+			messages: [
+				mk("a1"), mk("a2"), mk("a3"),
+				{ info: { role: "user" }, parts: [] },
+			],
+		} as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		assert.match(output.messages[0].parts[0].text, /^\[m\d+\] content of a1$/);
+		const ref1 = Number(/\[m(\d+)\]/.exec(output.messages[0].parts[0].text)![1]);
+		const ref3 = Number(/\[m(\d+)\]/.exec(output.messages[2].parts[0].text)![1]);
+
+		const result = await (hooks as any).tool.acp_compress.execute({
+			from: `m${ref1}`, to: `m${ref3}`,
+			summary: "Explored three test messages; concluded nothing needed.",
+		});
+		assert.match(result, /folded \(3 messages\)/);
+
+		// Next round: range collapses to the anchor summary; other texts blank.
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		assert.equal(output.messages[0].parts[0].text, `[m${ref1}..m${ref3} compressed] Explored three test messages; concluded nothing needed.`);
+		assert.equal(output.messages[1].parts[0].text, "");
+		assert.equal(output.messages[2].parts[0].text, "");
+
+		const status = await (hooks as any).tool.headroom_status.execute({});
+		assert.match(status, /acp ranges folded: 1/);
+	});
+
 	it("fires a toast only when the pressure tier changes", async () => {
 		const { hooks, toasts } = ctx;
 		const before = toasts.length;
@@ -254,11 +284,11 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(miss, /No matches/);
 	});
 
-	it("registers exactly the four model-facing tools", async () => {
+	it("registers exactly the five model-facing tools", async () => {
 		const { hooks } = ctx;
 		assert.deepEqual(
 			Object.keys((hooks as any).tool).sort(),
-			["headroom_compress", "headroom_retrieve", "headroom_search", "headroom_status"],
+			["acp_compress", "headroom_compress", "headroom_retrieve", "headroom_search", "headroom_status"],
 		);
 		await (hooks as any).dispose();
 	});

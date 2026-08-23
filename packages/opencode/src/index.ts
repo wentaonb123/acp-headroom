@@ -57,6 +57,17 @@ function isAnthropic(m?: { providerID?: string; api?: { npm?: string } }): boole
 // model's context window limit captured from chat.params.
 const usage = { contextTokens: 0, outputTokens: 0, cost: 0 };
 const pressure = { limit: 0 };
+// Lightweight ACP range compression: refs ([mN]) address older messages; the
+// model writes summaries via acp_compress; transform folds ranges on every
+// later round. Memory-only by design — an opencode restart yields a fresh
+// projection, so dangling ranges cannot exist. ponytail: single-instance map,
+// no cross-session isolation; add session keying only if concurrent sessions
+// ever show interference.
+const acpState = {
+	nextRef: 1,
+	refByInfo: new Map<string, number>(),
+	ranges: [] as Array<{ start: number; end: number; summary: string }>,
+};
 // Context composition: char counts by category from the last transform walk,
 // rescaled to the provider-reported total (chars/4 proportions, calibrated).
 const composition = {
@@ -92,6 +103,8 @@ const SYSTEM_LINES = [
 	"To find something you only vaguely remember from an older tool output, call headroom_search with keywords instead of guessing hashes.",
 	// Proactive compression teaching (pi's WHEN TO COMPRESS, condensed):
 	"Compress proactively regardless of context size: once you have extracted the key facts from a large tool result (build/test logs, diffs, directory listings, research output), call headroom_compress on that text and reference its marker instead of echoing the bulk into your reply.",
+	// Range compression teaching (ACP dialect):
+	"Older messages carry [mN] reference tags. When a whole stretch of older conversation is fully consumed — a finished exploration, a resolved thread, a completed task phase — call acp_compress with from/to covering its refs and a detailed summary you write; the range collapses to that summary in subsequent context. Never compress the current working set or verbatim-critical user instructions.",
 ];
 
 const COMPACTION_LINES = [
@@ -195,13 +208,13 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 					projected.push({ id: (part as ToolPart).id, role: "tool", text: state.output, toolName: (part as ToolPart).tool });
 				}
 			}
-			if (projected.length === 0) return;
+			// No early return when projected is empty — stage.apply() no-ops on
+			// empty arrays, and the ACP ref/fold pass below must still run.
 
 			// Adapter already filtered by position (i < lastUserIdx), so the
 			// stage's own recent-turn guard would double-filter on a projection
 			// that contains no user messages.
 			const result = await stage.apply(projected, { protectRecent: false });
-			if (result.replacements.size === 0) return;
 
 			if (stage.stats.applied === result.applied && stage.stats.savedTokens > 0) {
 				// First compression of the session — one-time heads-up.
@@ -218,6 +231,53 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 					if (replacement !== undefined && p.state.status === "completed") {
 						p.state.output = replacement;
 						p.state.metadata = { ...(p.state.metadata ?? {}), acpHeadroom: "compressed" };
+					}
+				}
+			}
+
+			// --- ACP: assign refs to older messages, tag visible text, fold ranges ---
+			// Runs AFTER mechanical compression so tool-result hashes survive inside
+			// folded ranges, and regardless of whether anything compressed above.
+			for (let i = 0; i < lastUserIdx; i++) {
+				const infoId = (msgs[i]!.info as { id?: string }).id;
+				if (infoId && !acpState.refByInfo.has(infoId)) {
+					acpState.refByInfo.set(infoId, acpState.nextRef++);
+				}
+			}
+			const refOf = (i: number): number | undefined => {
+				const infoId = (msgs[i]!.info as { id?: string }).id;
+				return infoId !== undefined ? acpState.refByInfo.get(infoId) : undefined;
+			};
+			for (let i = 0; i < lastUserIdx; i++) {
+				const ref = refOf(i);
+				if (ref === undefined) continue;
+				for (const part of msgs[i]!.parts ?? []) {
+					if (part.type === "tool") {
+						if (part.state?.status === "completed" && !part.state.output.startsWith("[m")) {
+							part.state.output = `[m${ref}] ${part.state.output}`;
+						}
+						continue;
+					}
+					const p = part as { text?: unknown };
+					if (typeof p.text === "string" && !p.text.startsWith("[m") && p.text.length > 0) {
+						p.text = `[m${ref}] ${p.text}`;
+					}
+				}
+			}
+			for (const r of acpState.ranges) {
+				let anchored = false;
+				for (let i = 0; i < lastUserIdx; i++) {
+					const ref = refOf(i);
+					if (ref === undefined || ref < r.start || ref > r.end) continue;
+					for (const part of msgs[i]!.parts ?? []) {
+						if (part.type === "tool") {
+							if (part.state?.status === "completed") part.state.output = `[m${r.start}..m${r.end} folded]`;
+							continue;
+						}
+						const p = part as { text?: unknown };
+						if (typeof p.text !== "string") continue;
+						p.text = anchored ? "" : `[m${r.start}..m${r.end} compressed] ${r.summary}`;
+						anchored = true;
 					}
 				}
 			}
@@ -246,15 +306,52 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			output.context.push(...COMPACTION_LINES);
 		},
 
-		async event({ event }) {
-			if (event.type === "session.created") stage.resetSession();
-		},
+			async event({ event }) {
+				if (event.type === "session.created") {
+					stage.resetSession();
+					acpState.nextRef = 1;
+					acpState.refByInfo.clear();
+					acpState.ranges.length = 0;
+				}
+			},
 
 		async dispose() {
 			stopSpawnedProxies();
 		},
 
 		tool: {
+			acp_compress: tool({
+				description:
+					"Compress a contiguous range of OLDER conversation messages into one summary you write. Reference messages by their [mN] tags (from/to inclusive). Use when the whole range is consumed — finished explorations, resolved threads, completed phases. Never include the current working set or verbatim-critical user instructions.",
+				args: {
+					from: tool.schema.string().describe("First ref in the range, e.g. \"m12\""),
+					to: tool.schema.string().describe("Last ref in the range (inclusive), e.g. \"m40\""),
+					summary: tool.schema.string().describe("Your detailed summary preserving decisions, constraints, outcomes and open questions"),
+				},
+				async execute(args) {
+					const parse = (s: string) => {
+						const m = /^m(\d+)$/i.exec(s.trim());
+						return m ? Number(m[1]) : null;
+					};
+					const start = parse(args.from);
+					const end = parse(args.to);
+					if (start === null || end === null || start < 1 || end < start) {
+						return `Invalid range "${args.from}..${args.to}". Use [mN] tags, from <= to.`;
+					}
+					if (end >= acpState.nextRef) {
+						return `Unknown refs: tags only go up to m${acpState.nextRef - 1}.`;
+					}
+					let count = 0;
+					for (const ref of acpState.refByInfo.values()) {
+						if (ref >= start && ref <= end) count++;
+					}
+					acpState.ranges.push({ start, end, summary: args.summary });
+					// Natural distillation: folding a range that overlaps earlier
+					// ranges swallows them — no explicit tier machinery needed.
+					return `Range ${args.from}..${args.to} folded (${count} messages). The summary replaces it in subsequent context; earlier overlapping folds are absorbed.`;
+				},
+			}),
+
 			headroom_compress: tool({
 				description:
 					"Compress a large piece of text through the Headroom proxy right now. Returns a short CCR summary carrying retrieval hashes; the original stays recoverable via headroom_retrieve. Use it to shrink bulky content you are about to echo into your reply.",
@@ -312,6 +409,7 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 						`minChars: ${cfg.minChars}, maxPerTurn: ${cfg.maxPerTurn}, timeoutMs: ${cfg.timeoutMs}, autoStart: ${cfg.autoStart}`,
 						`context at last LLM call: ${usage.contextTokens} input tokens (provider-reported)` + (pressure.limit > 0 ? ` / ${pressure.limit} = ${(ratio * 100).toFixed(0)}% [${tier}]` : ""),
 						`session stats: ${stage.stats.applied} results compressed, ~${stage.stats.savedTokens} tokens saved`,
+						`acp ranges folded: ${acpState.ranges.length}`,
 						`session usage: ${usage.outputTokens} output tokens, $${usage.cost.toFixed(4)}`,
 					];
 					if (composition.totalTokens > 0) {
