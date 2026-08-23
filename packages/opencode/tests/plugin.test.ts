@@ -150,6 +150,17 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(status, /30% \[normal\]/);
 		assert.match(status, /minChars: 4000/);
 
+		// Elevated zone (50% — pi's nudge band starts at 45%).
+		output = {
+			messages: [
+				{ info: { role: "assistant", cost: 0, tokens: { input: 99_500, output: 0, reasoning: 0, cache: { read: 500, write: 0 } } }, parts: [] },
+			],
+		} as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		status = await (hooks as any).tool.headroom_status.execute({});
+		assert.match(status, /50% \[elevated\]/);
+		assert.match(status, /minChars: 2000/);
+
 		// Aggressive zone (90%): minChars drops from default 4000 to 800.
 		output = {
 			messages: [

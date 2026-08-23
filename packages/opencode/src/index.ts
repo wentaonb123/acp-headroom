@@ -34,8 +34,10 @@ const settings = () => {
 	// env config always wins over escalation.
 	if (pressure.limit > 0 && base.minChars === undefined) {
 		const ratio = usage.contextTokens / pressure.limit;
-		if (ratio >= 0.8) return { ...base, minChars: 800, maxPerTurn: 24 };
-		if (ratio >= 0.6) return { ...base, minChars: 2000, maxPerTurn: 12 };
+		// Bands mirror acp-kernel's nudge config: minContextLimitPct 0.45,
+		// maxContextLimitPct 0.75.
+		if (ratio >= 0.75) return { ...base, minChars: 800, maxPerTurn: 24 };
+		if (ratio >= 0.45) return { ...base, minChars: 2000, maxPerTurn: 12 };
 	}
 	return base;
 };
@@ -43,6 +45,11 @@ const settings = () => {
 function numEnv(name: string): number | undefined {
 	const v = Number(process.env[name]);
 	return Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+function isAnthropic(m?: { providerID?: string; api?: { npm?: string } }): boolean {
+	if (!m) return false;
+	return m.providerID === "anthropic" || (m.api?.npm ?? "").includes("anthropic");
 }
 
 // Per-instance runtime state (one plugin instance per opencode server):
@@ -65,7 +72,9 @@ let lastTier: string | null = null;
 function computeTier(): string {
 	if (pressure.limit <= 0 || usage.contextTokens <= 0) return "normal";
 	const ratio = usage.contextTokens / pressure.limit;
-	return ratio >= 0.8 ? "aggressive" : ratio >= 0.6 ? "elevated" : "normal";
+	// Same bands as settings(): 45% (acp-kernel minContextLimitPct) and
+	// 75% (maxContextLimitPct).
+	return ratio >= 0.75 ? "aggressive" : ratio >= 0.45 ? "elevated" : "normal";
 }
 
 function resetComposition(): void {
@@ -96,7 +105,13 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 
 	return {
 		async "chat.params"(input) {
-			pressure.limit = input.model?.limit?.context ?? 0;
+			// Reserve the output budget for OpenAI-family windows (they count
+			// output against the limit; Anthropic does not — same rule as
+			// acp-kernel's shouldReserveOutputHeadroom). Conservative default.
+			const m = input.model;
+			const ctx = m?.limit?.context ?? 0;
+			const out = m?.limit?.output ?? 0;
+			pressure.limit = ctx > 0 && out > 0 && out < ctx && !isAnthropic(m) ? ctx - out : ctx;
 		},
 
 		async "experimental.chat.messages.transform"(input, output) {
