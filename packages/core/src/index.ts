@@ -10,6 +10,7 @@ export {
 	startProxy,
 	stopSpawnedProxies,
 } from "./client.js";
+export { ccrDirectory, searchOriginals, type SearchHit } from "./search.js";
 export {
 	DEFAULT_HEADROOM_CONFIG,
 	DEFAULT_PROTECTED_TOOLS,

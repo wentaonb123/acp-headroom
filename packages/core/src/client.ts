@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { homedir } from "node:os";
 import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { logWarn } from "./log.js";
+import { ccrDirectory } from "./search.js";
 
 /** HTTP client for the local Headroom compression proxy plus the plugin-side
  *  CCR disk backup. All functions fail-open (return null / false) — the stage
@@ -264,9 +265,7 @@ export function isValidHash(hash: string): boolean {
 // KB-MB scale; add LRU eviction only if the directory ever matters on disk.
 
 function ccrDir(): string {
-	// path.resolve pins a relative HEADROOM_CCR_DIR override to something
-	// predictable instead of wherever the host happened to be started.
-	return path.resolve(process.env.HEADROOM_CCR_DIR ?? path.join(homedir(), ".acp-headroom", "ccr"));
+	return ccrDirectory();
 }
 
 export async function saveOriginals(hashes: string[], original: string): Promise<void> {

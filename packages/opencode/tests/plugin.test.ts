@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
 import { after, before, describe, it } from "node:test";
 import { AcpHeadroomPlugin } from "../dist/index.js";
 
@@ -41,6 +43,8 @@ before(async () => {
 	process.env.HEADROOM_PROXY_URL = `http://127.0.0.1:${port}`;
 	process.env.HEADROOM_AUTOSTART = "0";
 	process.env.ACP_HEADROOM_DEBUG = "1";
+	// Isolate CCR backups — never touch the real ~/.acp-headroom/ccr.
+	process.env.HEADROOM_CCR_DIR = mkdtempSync(tmpdir() + "/acp-headroom-test-");
 });
 
 after(() => new Promise<void>((r) => server.close(() => r())));
@@ -121,7 +125,7 @@ describe("acp-headroom-opencode plugin", () => {
 		const { hooks } = ctx;
 		const output = { system: ["base"] } as any;
 		await (hooks as any)["experimental.chat.system.transform"]({}, output);
-		assert.equal(output.system.length, 3);
+		assert.equal(output.system.length, 4); // base + 3 instruction lines
 		assert.ok(output.system.some((l: string) => l.includes("headroom_retrieve")));
 	});
 
@@ -131,8 +135,35 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(result, /No original found/);
 	});
 
-	it("registers exactly the two model-facing tools", async () => {
+	it("compaction hook injects hash-preservation instructions", async () => {
 		const { hooks } = ctx;
-		assert.deepEqual(Object.keys((hooks as any).tool).sort(), ["headroom_retrieve", "headroom_status"]);
+		const output = { context: [] as string[], prompt: undefined } as any;
+		await (hooks as any)["experimental.session.compacting"]({ sessionID: "s1" }, output);
+		assert.equal(output.context.length, 2);
+		assert.ok(output.context.some((l: string) => l.includes("headroom_retrieve")));
+	});
+
+	it("headroom_compress compresses on demand and saves the original", async () => {
+		const { hooks } = ctx;
+		const result = await (hooks as any).tool.headroom_compress.execute({ text: BIG_TEXT, tool_name: "read" });
+		assert.match(result, /Retrieve original: hash=a1b2c3d4e5f6/);
+		assert.match(result, /compressed from 6000 to \d+ chars/);
+	});
+
+	it("headroom_search finds saved originals by keyword", async () => {
+		const { hooks } = ctx;
+		const result = await (hooks as any).tool.headroom_search.execute({ query: "xxxxx" });
+		assert.match(result, /a1b2c3d4e5f6: /);
+		const miss = await (hooks as any).tool.headroom_search.execute({ query: "zzz-not-there" });
+		assert.match(miss, /No matches/);
+	});
+
+	it("registers exactly the four model-facing tools", async () => {
+		const { hooks } = ctx;
+		assert.deepEqual(
+			Object.keys((hooks as any).tool).sort(),
+			["headroom_compress", "headroom_retrieve", "headroom_search", "headroom_status"],
+		);
+		await (hooks as any).dispose();
 	});
 });

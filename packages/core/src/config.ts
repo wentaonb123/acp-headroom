@@ -34,7 +34,7 @@ export interface ResolvedHeadroomConfig {
 
 /** Tools defined by this package family — their outputs are markers/stats,
  *  never compressible payloads. Hosts add their own via settings.protectedTools. */
-export const DEFAULT_PROTECTED_TOOLS = ["headroom_compress", "headroom_status", "headroom_retrieve"];
+export const DEFAULT_PROTECTED_TOOLS = ["headroom_compress", "headroom_search", "headroom_status", "headroom_retrieve"];
 
 export const DEFAULT_HEADROOM_CONFIG: ResolvedHeadroomConfig = {
 	enabled: true,

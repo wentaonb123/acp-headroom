@@ -1,6 +1,6 @@
 import { type Plugin, tool } from "@opencode-ai/plugin";
 import type { ToolPart } from "@opencode-ai/sdk";
-import { HeadroomStage, originOf, proxyHealthy, resolveHeadroom, retrieveOriginal, type StageMessage } from "acp-headroom-core";
+import { compressToolOutput, HeadroomStage, originOf, proxyHealthy, resolveHeadroom, retrieveOriginal, saveOriginals, searchOriginals, stopSpawnedProxies, type StageMessage } from "acp-headroom-core";
 
 /**
  * ACP+Headroom for OpenCode — same sent-view architecture as acp-headroom-pi:
@@ -36,6 +36,12 @@ function numEnv(name: string): number | undefined {
 const SYSTEM_LINES = [
 	"Large tool results may be mechanically compressed into short summaries carrying CCR retrieval hashes (marker formats: 'Retrieve more: hash=<hex>' or 'Retrieve original: hash=<hex>').",
 	"When you need the exact full content of a compressed result, call headroom_retrieve with the hex hash from its marker.",
+	"To find something you only vaguely remember from an older tool output, call headroom_search with keywords instead of guessing hashes.",
+];
+
+const COMPACTION_LINES = [
+	"Context note: some tool results in this conversation were mechanically compressed into short CCR summaries carrying retrieval hashes ('Retrieve more/original: hash=<hex>').",
+	"When summarizing, preserve those hash references verbatim — the full originals remain recoverable via the headroom_retrieve tool.",
 ];
 
 export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
@@ -116,7 +122,53 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			output.system.push(...SYSTEM_LINES);
 		},
 
+		async "experimental.session.compacting"(input, output) {
+			void input;
+			// Overflow self-heal, opencode dialect: the summarizer sees compressed
+			// markers, not originals — teach it to keep the retrieval paths alive.
+			output.context.push(...COMPACTION_LINES);
+		},
+
+		async event({ event }) {
+			if (event.type === "session.created") stage.resetSession();
+		},
+
+		async dispose() {
+			stopSpawnedProxies();
+		},
+
 		tool: {
+			headroom_compress: tool({
+				description:
+					"Compress a large piece of text through the Headroom proxy right now. Returns a short CCR summary carrying retrieval hashes; the original stays recoverable via headroom_retrieve. Use it to shrink bulky content you are about to echo into your reply.",
+				args: {
+					text: tool.schema.string().describe("The exact text to compress"),
+					tool_name: tool.schema.string().optional().describe("Optional source name for provenance"),
+				},
+				async execute(args) {
+					const cfg = resolveHeadroom(settings());
+					const outcome = await compressToolOutput(cfg.proxyUrl, { toolName: args.tool_name ?? "manual", text: args.text, timeoutMs: cfg.timeoutMs });
+					if (!outcome || outcome.text.length >= args.text.length) {
+						return "Compression not beneficial (proxy unreachable or no size gain); keep the original text.";
+					}
+					await saveOriginals(outcome.hashes, args.text);
+					return `${outcome.text}\n[compressed from ${args.text.length} to ${outcome.text.length} chars; hashes: ${outcome.hashes.join(", ") || "none"}]`;
+				},
+			}),
+
+			headroom_search: tool({
+				description:
+					"Full-text search across all compressed-original backups on local disk. Returns ranked hash + snippet hits; pair with headroom_retrieve to expand a hit.",
+				args: {
+					query: tool.schema.string().describe("Space-separated keywords"),
+				},
+				async execute(args) {
+					const hits = await searchOriginals(args.query);
+					if (hits.length === 0) return "No matches in compressed originals.";
+					return hits.map((h) => `${h.hash}: …${h.snippet}…`).join("\n");
+				},
+			}),
+
 			headroom_retrieve: tool({
 				description:
 					"Retrieve the full original of a compressed tool result by its hash. Use whenever a tool output contains 'Retrieve original: hash=<...>' markers and you need the exact untruncated content.",
