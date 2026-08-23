@@ -1,5 +1,8 @@
 import { type Plugin, tool } from "@opencode-ai/plugin";
 import type { ToolPart } from "@opencode-ai/sdk";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { homedir } from "node:os";
 import { compressToolOutput, HeadroomStage, originOf, proxyHealthy, resolveHeadroom, retrieveOriginal, saveOriginals, searchOriginals, stopSpawnedProxies, type StageMessage } from "acp-headroom-core";
 
 /**
@@ -67,7 +70,56 @@ const acpState = {
 	nextRef: 1,
 	refByInfo: new Map<string, number>(),
 	ranges: [] as Array<{ start: number; end: number; summary: string }>,
+	sessionId: "",
+	loadedFor: "",
 };
+
+// Range persistence: folds survive opencode restarts (pi persists compressed
+// blocks too — without this, every restart re-inflates context back to the
+// pre-fold size). Keyed per session; refs are positional and stable for
+// unchanged history, so restored ranges keep pointing at the right messages.
+// ponytail: stale session files are KB-scale — no GC; add cleanup only if the
+// ranges dir ever matters on disk.
+function rangesDir(): string {
+	return path.resolve(process.env.HEADROOM_RANGES_DIR ?? path.join(homedir(), ".acp-headroom", "ranges"));
+}
+
+async function loadRanges(sessionId: string): Promise<void> {
+	if (!sessionId || acpState.loadedFor === sessionId) return;
+	acpState.loadedFor = sessionId;
+	// Disk truth replaces in-memory state wholesale — otherwise a session
+	// without a persisted file would inherit the previous session's folds.
+	const ranges: Array<{ start: number; end: number; summary: string }> = [];
+	let next = 1;
+	try {
+		const raw = await fs.readFile(path.join(rangesDir(), `${sessionId}.json`), "utf8");
+		const data = JSON.parse(raw) as { nextRef?: unknown; ranges?: Array<{ start?: unknown; end?: unknown; summary?: unknown }> };
+		if (Array.isArray(data.ranges)) {
+			for (const r of data.ranges) {
+				if (typeof r.start === "number" && typeof r.end === "number" && typeof r.summary === "string") {
+					ranges.push({ start: r.start, end: r.end, summary: r.summary });
+					next = Math.max(next, r.end + 1);
+				}
+			}
+			if (typeof data.nextRef === "number") next = Math.max(next, data.nextRef);
+		}
+	} catch {
+		// missing/corrupt file → fresh empty state (fail-open)
+	}
+	acpState.ranges = ranges;
+	acpState.nextRef = Math.max(acpState.nextRef, next);
+}
+
+async function saveRanges(): Promise<void> {
+	if (!acpState.sessionId) return;
+	try {
+		const dir = rangesDir();
+		await fs.mkdir(dir, { recursive: true });
+		await fs.writeFile(path.join(dir, `${acpState.sessionId}.json`), JSON.stringify({ nextRef: acpState.nextRef, ranges: acpState.ranges }), "utf8");
+	} catch {
+		// fail-open: folding still works this round even if persistence failed
+	}
+}
 // Context composition: char counts by category from the last transform walk,
 // rescaled to the provider-reported total (chars/4 proportions, calibrated).
 const composition = {
@@ -120,6 +172,10 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 
 	return {
 		async "chat.params"(input) {
+			acpState.sessionId = input.sessionID ?? "";
+			// Awaited: a floating load would resolve mid-turn and clobber folds
+			// pushed by acp_compress with stale disk truth (real race, see tests).
+			await loadRanges(acpState.sessionId);
 			// Reserve the output budget for OpenAI-family windows (they count
 			// output against the limit; Anthropic does not — same rule as
 			// acp-kernel's shouldReserveOutputHeadroom). Conservative default.
@@ -238,6 +294,7 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			// --- ACP: assign refs to older messages, tag visible text, fold ranges ---
 			// Runs AFTER mechanical compression so tool-result hashes survive inside
 			// folded ranges, and regardless of whether anything compressed above.
+			await loadRanges(acpState.sessionId);
 			for (let i = 0; i < lastUserIdx; i++) {
 				const infoId = (msgs[i]!.info as { id?: string }).id;
 				if (infoId && !acpState.refByInfo.has(infoId)) {
@@ -312,6 +369,7 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 					acpState.nextRef = 1;
 					acpState.refByInfo.clear();
 					acpState.ranges.length = 0;
+					acpState.loadedFor = ""; // next chat.params reloads (empty) from disk
 				}
 			},
 
@@ -368,6 +426,7 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 							if (ref >= start && ref <= end) count++;
 						}
 						acpState.ranges.push({ start, end, summary: r.summary });
+					await saveRanges();
 						results.push(`✓ ${r.from}..${r.to} folded (${count} messages)`);
 					}
 					// Natural distillation: folding a range that overlaps earlier

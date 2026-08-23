@@ -43,8 +43,9 @@ before(async () => {
 	process.env.HEADROOM_PROXY_URL = `http://127.0.0.1:${port}`;
 	process.env.HEADROOM_AUTOSTART = "0";
 	process.env.ACP_HEADROOM_DEBUG = "1";
-	// Isolate CCR backups — never touch the real ~/.acp-headroom/ccr.
+	// Isolate CCR backups — never touch the real ~/.acp-headroom.
 	process.env.HEADROOM_CCR_DIR = mkdtempSync(tmpdir() + "/acp-headroom-test-");
+	process.env.HEADROOM_RANGES_DIR = mkdtempSync(tmpdir() + "/acp-headroom-ranges-");
 });
 
 after(() => new Promise<void>((r) => server.close(() => r())));
@@ -278,6 +279,36 @@ describe("acp-headroom-opencode plugin", () => {
 
 		const status = await (hooks as any).tool.headroom_status.execute({});
 		assert.match(status, /acp ranges folded: [2-9]/); // prior test's fold + these two
+	});
+
+	it("persists acp ranges to disk and restores them per session", async () => {
+		const { hooks } = ctx;
+		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });
+		const output = { messages: [mk("pp1"), mk("pp2"), { info: { role: "user" }, parts: [] }] } as any;
+		const limit = { model: { id: "m", providerID: "p", limit: { context: 1_000_000 } } };
+
+		// Session p1: fold pp1..pp2.
+		await (hooks as any)["chat.params"]({ sessionID: "persist-p1", ...limit }, {});
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		const r1 = Number(/\[m(\d+)\]/.exec(output.messages[0].parts[0].text)![1]);
+		const r2 = Number(/\[m(\d+)\]/.exec(output.messages[1].parts[0].text)![1]);
+		await (hooks as any).tool.acp_compress.execute({ from: `m${r1}`, to: `m${r2}`, summary: "Persisted fold check." });
+		const file = JSON.parse(await import("node:fs/promises").then((m) => m.readFile(`${process.env.HEADROOM_RANGES_DIR}/persist-p1.json`, "utf8")));
+		assert.ok(file.ranges.some((x: any) => x.summary === "Persisted fold check."), "range written to disk");
+
+		// Session p2: fresh state — no folding for these messages.
+		await (hooks as any)["chat.params"]({ sessionID: "persist-p2", ...limit }, {});
+		const outP2 = { messages: [mk("qq1"), mk("qq2"), { info: { role: "user" }, parts: [] }] } as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, outP2);
+		const statusP2 = await (hooks as any).tool.headroom_status.execute({});
+		assert.match(statusP2, /acp ranges folded: 0/); // disk truth for p2 = no folds
+
+		// Back to session p1: restored from disk, folding re-applies.
+		await (hooks as any)["chat.params"]({ sessionID: "persist-p1", ...limit }, {});
+		const outP1 = { messages: [mk("pp1"), mk("pp2"), { info: { role: "user" }, parts: [] }] } as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, outP1);
+		assert.match(outP1.messages[0].parts[0].text, /compressed\] Persisted fold check\./);
+		assert.equal(outP1.messages[1].parts[0].text, "");
 	});
 
 	it("fires a toast only when the pressure tier changes", async () => {
