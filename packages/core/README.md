@@ -9,7 +9,9 @@ import { HeadroomStage, resolveHeadroom, retrieveOriginal } from "acp-headroom-c
 
 const stage = new HeadroomStage(() => ({ minChars: 4000 }));
 
-// Sent-view mode: project your tool messages, apply before the LLM call
+// Sent-view mode: project your tool messages, apply before the LLM call.
+// Pass full arrays (with user messages) for recent-turn protection, or
+// { protectRecent: false } when you pre-filtered by position.
 const result = await stage.apply([
   { id: "m1", role: "tool", text: bigToolOutput, toolName: "read" },
 ]);

@@ -82,7 +82,10 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			}
 			if (projected.length === 0) return;
 
-			const result = await stage.apply(projected);
+			// Adapter already filtered by position (i < lastUserIdx), so the
+			// stage's own recent-turn guard would double-filter on a projection
+			// that contains no user messages.
+			const result = await stage.apply(projected, { protectRecent: false });
 			if (result.replacements.size === 0) return;
 
 			if (stage.stats.applied === result.applied && stage.stats.savedTokens > 0) {

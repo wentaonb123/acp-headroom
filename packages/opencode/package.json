@@ -21,6 +21,7 @@
 		"node": ">=20"
 	},
 	"scripts": {
+		"test": "node --import tsx --test tests/*.test.ts",
 		"typecheck": "tsc --noEmit",
 		"build": "tsup && tsc --emitDeclarationOnly"
 	},
@@ -49,6 +50,7 @@
 	"devDependencies": {
 		"@opencode-ai/plugin": "latest",
 		"tsup": "^8.5.1",
+		"tsx": "^4.23.1",
 		"typescript": "^7.0.2"
 	}
 }

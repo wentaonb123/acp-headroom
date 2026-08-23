@@ -65,27 +65,36 @@ export class HeadroomStage {
 	}
 
 	/** Compress oversized tool results. Returns id → replacement text; never
-	 *  throws (fail-open). */
-	async apply(coreMessages: StageMessage[]): Promise<HeadroomApplyResult> {
+	 *  throws (fail-open).
+	 *  protectRecent (default true): never touch results after the last user
+	 *  message — requires the array to actually contain user messages (pi's
+	 *  full-array projection). Callers that pre-filtered by position (e.g.
+	 *  opencode parts projection) pass false. */
+	async apply(coreMessages: StageMessage[], opts?: { protectRecent?: boolean }): Promise<HeadroomApplyResult> {
 		const cfg = resolveHeadroom(this.getSettings());
 		if (!cfg.enabled || coreMessages.length === 0) return emptyResult();
+		const protectRecent = opts?.protectRecent !== false;
 		try {
-			return await this.applyInner(coreMessages, cfg);
+			return await this.applyInner(coreMessages, cfg, protectRecent);
 		} catch (e) {
 			logWarn("headroom", { event: "stage-error", error: e instanceof Error ? e.message : String(e) });
 			return emptyResult();
 		}
 	}
 
-	private async applyInner(coreMessages: StageMessage[], cfg: ResolvedHeadroomConfig): Promise<HeadroomApplyResult> {
+	private async applyInner(coreMessages: StageMessage[], cfg: ResolvedHeadroomConfig, protectRecent: boolean): Promise<HeadroomApplyResult> {
 		if (!(await this.ensureProxy(cfg))) return { ...emptyResult(), available: false };
 
 		const modelId = "default";
 
 		// Current-turn results are the model's active working set — never touched.
 		let lastUserIdx = -1;
-		for (let i = coreMessages.length - 1; i >= 0; i--) {
-			if (coreMessages[i]!.role === "user") { lastUserIdx = i; break; }
+		if (protectRecent) {
+			for (let i = coreMessages.length - 1; i >= 0; i--) {
+				if (coreMessages[i]!.role === "user") { lastUserIdx = i; break; }
+			}
+		} else {
+			lastUserIdx = coreMessages.length;
 		}
 
 		const candidates = coreMessages
