@@ -1,0 +1,54 @@
+{
+	"name": "acp-headroom-opencode",
+	"version": "0.1.0",
+	"description": "Headroom tool-output compression for OpenCode — compresses oversized tool results via a local Headroom proxy and lets the model retrieve originals back by hash.",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"sideEffects": false,
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"build": "tsup && tsc --emitDeclarationOnly"
+	},
+	"keywords": [
+		"opencode",
+		"opencode-plugin",
+		"headroom",
+		"context-compression",
+		"ccr",
+		"tokens",
+		"llm"
+	],
+	"author": "wentaonb123",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/wentaonb123/acp-headroom.git",
+		"directory": "packages/opencode"
+	},
+	"dependencies": {
+		"acp-headroom-core": "^0.1.0"
+	},
+	"peerDependencies": {
+		"@opencode-ai/plugin": "*"
+	},
+	"devDependencies": {
+		"@opencode-ai/plugin": "latest",
+		"tsup": "^8.5.1",
+		"typescript": "^7.0.2"
+	}
+}

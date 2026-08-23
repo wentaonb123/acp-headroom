@@ -1,0 +1,47 @@
+{
+	"name": "acp-headroom-core",
+	"version": "0.1.0",
+	"description": "Host-agnostic core for ACP+Headroom tool-output compression: proxy client, hysteretic health, origin-keyed cache, CCR backup. Used by acp-headroom-pi and acp-headroom-opencode.",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"sideEffects": false,
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"test": "node --import tsx --test tests/*.test.ts",
+		"typecheck": "tsc --noEmit",
+		"build": "tsup && tsc --emitDeclarationOnly"
+	},
+	"keywords": [
+		"headroom",
+		"context-compression",
+		"ccr",
+		"llm",
+		"tokens"
+	],
+	"author": "wentaonb123",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/wentaonb123/acp-headroom.git"
+	},
+	"devDependencies": {
+		"@types/node": "^26.1.2",
+		"tsup": "^8.5.1",
+		"tsx": "^4.23.1",
+		"typescript": "^7.0.2"
+	}
+}
