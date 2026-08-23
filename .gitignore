@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.tsbuildinfo
 *.tgz
+
+*.log
+err.txt
+full.txt
