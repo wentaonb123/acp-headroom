@@ -22,6 +22,9 @@ import { HeadroomStage, originOf, proxyHealthy, resolveHeadroom, retrieveOrigina
 const settings = () => ({
 	proxyUrl: process.env.HEADROOM_PROXY_URL,
 	minChars: numEnv("HEADROOM_MIN_CHARS"),
+	// Real-kompress on large payloads routinely exceeds 3s server-side
+	// (proxy's own budget is 30s) — give it 10s by default.
+	timeoutMs: numEnv("HEADROOM_TIMEOUT_MS") ?? 10_000,
 	autoStart: process.env.HEADROOM_AUTOSTART !== "0",
 });
 
@@ -31,8 +34,8 @@ function numEnv(name: string): number | undefined {
 }
 
 const SYSTEM_LINES = [
-	"Large tool results may be mechanically compressed into CCR markers containing hashes.",
-	"When you need exact content from a compressed result, call headroom_retrieve with the hash from its 'Retrieve original: hash=<...>' marker.",
+	"Large tool results may be mechanically compressed into short summaries carrying CCR retrieval hashes (marker formats: 'Retrieve more: hash=<hex>' or 'Retrieve original: hash=<hex>').",
+	"When you need the exact full content of a compressed result, call headroom_retrieve with the hex hash from its marker.",
 ];
 
 export const AcpHeadroomPlugin: Plugin = async ({ client }) => {

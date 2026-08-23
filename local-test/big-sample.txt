@@ -1,0 +1,418 @@
+// src/client.ts
+import { promises as fs } from "fs";
+import * as path from "path";
+import { homedir } from "os";
+import { spawn, execFile } from "child_process";
+
+// src/log.ts
+function logWarn(scope, event) {
+  if (!process.env.ACP_HEADROOM_DEBUG) return;
+  console.error(`[acp-headroom][${scope}]`, JSON.stringify(event));
+}
+
+// src/client.ts
+var HEALTH_TTL_MS = 3e4;
+var HEALTH_TIMEOUT_MS = 3e3;
+var NEGATIVE_TTL_MS = 15e3;
+var healthStates = /* @__PURE__ */ new Map();
+function originOf(baseUrl) {
+  try {
+    return new URL(baseUrl).origin;
+  } catch {
+    return baseUrl;
+  }
+}
+function healthStateFor(baseUrl) {
+  const key = originOf(baseUrl);
+  let state = healthStates.get(key);
+  if (!state) {
+    state = { healthyUntil: 0, unhealthyUntil: 0 };
+    healthStates.set(key, state);
+  }
+  return state;
+}
+function invalidateHealth(baseUrl) {
+  if (baseUrl) {
+    healthStates.delete(originOf(baseUrl));
+    return;
+  }
+  healthStates.clear();
+}
+async function healthOnce(baseUrl, timeoutMs) {
+  let ok = false;
+  try {
+    const resp = await fetch(new URL("/health", baseUrl), { signal: AbortSignal.timeout(timeoutMs) });
+    ok = resp.ok;
+  } catch {
+    ok = false;
+  }
+  return ok;
+}
+async function proxyHealthy(baseUrl, timeoutMs = HEALTH_TIMEOUT_MS) {
+  const now = Date.now();
+  const state = healthStateFor(baseUrl);
+  if (now < state.healthyUntil) return true;
+  if (now < state.unhealthyUntil) return false;
+  if (await healthOnce(baseUrl, timeoutMs) || await healthOnce(baseUrl, timeoutMs)) {
+    state.healthyUntil = Date.now() + HEALTH_TTL_MS;
+    state.unhealthyUntil = 0;
+    return true;
+  }
+  state.unhealthyUntil = Date.now() + NEGATIVE_TTL_MS;
+  return false;
+}
+var spawnedProxies = /* @__PURE__ */ new Set();
+var startingProxies = /* @__PURE__ */ new Map();
+function startProxy(baseUrl) {
+  const key = originOf(baseUrl);
+  const inFlight = startingProxies.get(key);
+  if (inFlight) return inFlight;
+  const attempt = startProxyInner(baseUrl).finally(() => startingProxies.delete(key));
+  startingProxies.set(key, attempt);
+  return attempt;
+}
+function killProxyTree(child) {
+  try {
+    if (process.platform === "win32" && child.pid) {
+      execFile("taskkill", ["/pid", String(child.pid), "/T", "/F"], () => {
+      });
+    } else {
+      child.kill();
+    }
+  } catch {
+    try {
+      child.kill();
+    } catch {
+    }
+  }
+}
+function stopSpawnedProxies() {
+  for (const child of spawnedProxies) killProxyTree(child);
+  spawnedProxies.clear();
+}
+async function startProxyInner(baseUrl) {
+  const url = new URL(baseUrl);
+  const port = url.port || "8787";
+  const commands = [
+    { cmd: "headroom", args: ["proxy", "--port", port] },
+    { cmd: "uv", args: ["tool", "run", "--from", "headroom-ai[proxy]", "headroom", "proxy", "--port", port] }
+  ];
+  for (const { cmd, args } of commands) {
+    let failed = false;
+    let child;
+    try {
+      child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
+    } catch {
+      continue;
+    }
+    child.on("error", () => {
+      failed = true;
+      spawnedProxies.delete(child);
+    });
+    spawnedProxies.add(child);
+    child.unref();
+    const deadline = Date.now() + 2e4;
+    while (!failed && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (await healthOnce(baseUrl, HEALTH_TIMEOUT_MS)) {
+        const state = healthStateFor(baseUrl);
+        state.healthyUntil = Date.now() + HEALTH_TTL_MS;
+        state.unhealthyUntil = 0;
+        return true;
+      }
+    }
+    killProxyTree(child);
+    spawnedProxies.delete(child);
+  }
+  return false;
+}
+async function compressToolOutput(baseUrl, opts) {
+  const body = {
+    model: opts.model ?? "default",
+    messages: [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "call_acp_headroom_core", type: "function", function: { name: opts.toolName || "tool", arguments: "{}" } }]
+      },
+      { role: "tool", tool_call_id: "call_acp_headroom_core", content: opts.text }
+    ],
+    config: { mode: "ccr", protect_recent: 0 }
+  };
+  try {
+    const resp = await fetch(new URL("/v1/compress", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(opts.timeoutMs)
+    });
+    if (!resp.ok) {
+      logWarn("headroom", { event: "compress-http-error", status: resp.status });
+      void resp.body?.cancel().catch(() => {
+      });
+      return null;
+    }
+    const data = await resp.json();
+    healthStateFor(baseUrl).healthyUntil = Date.now() + HEALTH_TTL_MS;
+    const msgs = data.messages ?? [];
+    let text = null;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === "tool") {
+        text = contentToText(msgs[i].content);
+        break;
+      }
+    }
+    if (!text) return null;
+    return {
+      text,
+      tokensBefore: numOr(data.tokens_before, 0),
+      tokensAfter: numOr(data.tokens_after, 0),
+      hashes: Array.isArray(data.ccr_hashes) ? data.ccr_hashes.filter((h) => typeof h === "string") : []
+    };
+  } catch (e) {
+    logWarn("headroom", { event: "compress-failed", error: e instanceof Error ? e.message : String(e) });
+    healthStateFor(baseUrl).healthyUntil = 0;
+    return null;
+  }
+}
+function numOr(v, fallback) {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function contentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts = content.map((b) => b && typeof b === "object" && b.type === "text" ? b.text : void 0).filter((t) => typeof t === "string");
+    return parts.length > 0 ? parts.join("\n") : null;
+  }
+  return null;
+}
+function isValidHash(hash) {
+  return /^[a-f0-9]{12,24}$/i.test(hash);
+}
+function ccrDir() {
+  return path.resolve(process.env.HEADROOM_CCR_DIR ?? path.join(homedir(), ".acp-headroom", "ccr"));
+}
+async function saveOriginals(hashes, original) {
+  if (hashes.length === 0) return;
+  try {
+    const dir = ccrDir();
+    await fs.mkdir(dir, { recursive: true });
+    await Promise.all(hashes.map(async (h) => {
+      if (!isValidHash(h)) return;
+      const file = path.join(dir, `${h.toLowerCase()}.txt`);
+      await fs.writeFile(file, original, { encoding: "utf8", mode: 384 });
+    }));
+  } catch (e) {
+    logWarn("headroom", { event: "ccr-save-failed", error: e instanceof Error ? e.message : String(e) });
+  }
+}
+async function retrieveOriginal(baseUrl, hash, timeoutMs = 1e4) {
+  if (!isValidHash(hash)) return null;
+  const fileHash = hash.toLowerCase();
+  try {
+    return await fs.readFile(path.join(ccrDir(), `${fileHash}.txt`), "utf8");
+  } catch {
+  }
+  try {
+    const resp = await fetch(new URL(`/v1/retrieve/${hash}`, baseUrl), { signal: AbortSignal.timeout(timeoutMs) });
+    if (!resp.ok) {
+      void resp.body?.cancel().catch(() => {
+      });
+      return null;
+    }
+    const data = await resp.json();
+    if (typeof data === "string") return data;
+    if (data && typeof data === "object") {
+      const obj = data;
+      if (typeof obj.original_content === "string") return obj.original_content;
+      const viaContent = typeof obj.content === "string" ? obj.content : contentToText(obj.content);
+      if (viaContent) return viaContent;
+    }
+    logWarn("headroom", { event: "retrieve-unexpected-shape", sample: JSON.stringify(data).slice(0, 200) });
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// src/config.ts
+var DEFAULT_PROTECTED_TOOLS = ["headroom_compress", "headroom_status", "headroom_retrieve"];
+var DEFAULT_HEADROOM_CONFIG = {
+  enabled: true,
+  proxyUrl: "http://127.0.0.1:8787",
+  minChars: 4e3,
+  maxPerTurn: 8,
+  timeoutMs: 3e3,
+  protectedTools: DEFAULT_PROTECTED_TOOLS,
+  autoStart: true
+};
+function resolveHeadroom(settings) {
+  if (settings === false) return { ...DEFAULT_HEADROOM_CONFIG, enabled: false };
+  const s = typeof settings === "object" && settings !== null ? settings : {};
+  return {
+    enabled: s.enabled !== false,
+    proxyUrl: normalizeBase(process.env.HEADROOM_PROXY_URL ?? s.proxyUrl ?? DEFAULT_HEADROOM_CONFIG.proxyUrl),
+    minChars: posInt(s.minChars, DEFAULT_HEADROOM_CONFIG.minChars),
+    maxPerTurn: posInt(s.maxPerTurn, DEFAULT_HEADROOM_CONFIG.maxPerTurn),
+    timeoutMs: posInt(s.timeoutMs, DEFAULT_HEADROOM_CONFIG.timeoutMs),
+    protectedTools: unique([...DEFAULT_PROTECTED_TOOLS, ...Array.isArray(s.protectedTools) ? s.protectedTools.filter((t) => typeof t === "string") : []]),
+    autoStart: s.autoStart !== false
+  };
+}
+function posInt(v, fallback) {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
+}
+function normalizeBase(url) {
+  return url.replace(/\/+$/, "");
+}
+function unique(items) {
+  return [...new Set(items)];
+}
+
+// src/stage.ts
+import { createHash } from "crypto";
+var ALREADY_COMPRESSED = ["Retrieve more: hash=", "Retrieve original: hash=", "<<ccr:"];
+function emptyResult() {
+  return { replacements: /* @__PURE__ */ new Map(), applied: 0, savedTokens: 0, available: true };
+}
+var CACHE_MAX = 500;
+var HeadroomStage = class {
+  constructor(getSettings = () => void 0) {
+    this.getSettings = getSettings;
+  }
+  getSettings;
+  stats = { applied: 0, savedTokens: 0 };
+  cache = /* @__PURE__ */ new Map();
+  proxyTried = false;
+  unavailableNotified = false;
+  resetSession() {
+    this.stats = { applied: 0, savedTokens: 0 };
+    this.cache.clear();
+    this.proxyTried = false;
+    this.unavailableNotified = false;
+  }
+  /** Compress oversized tool results. Returns id → replacement text; never
+   *  throws (fail-open).
+   *  protectRecent (default true): never touch results after the last user
+   *  message — requires the array to actually contain user messages (pi's
+   *  full-array projection). Callers that pre-filtered by position (e.g.
+   *  opencode parts projection) pass false. */
+  async apply(coreMessages, opts) {
+    const cfg = resolveHeadroom(this.getSettings());
+    if (!cfg.enabled || coreMessages.length === 0) return emptyResult();
+    const protectRecent = opts?.protectRecent !== false;
+    try {
+      return await this.applyInner(coreMessages, cfg, protectRecent);
+    } catch (e) {
+      logWarn("headroom", { event: "stage-error", error: e instanceof Error ? e.message : String(e) });
+      return emptyResult();
+    }
+  }
+  async applyInner(coreMessages, cfg, protectRecent) {
+    if (!await this.ensureProxy(cfg)) return { ...emptyResult(), available: false };
+    const modelId = "default";
+    let lastUserIdx = -1;
+    if (protectRecent) {
+      for (let i = coreMessages.length - 1; i >= 0; i--) {
+        if (coreMessages[i].role === "user") {
+          lastUserIdx = i;
+          break;
+        }
+      }
+    } else {
+      lastUserIdx = coreMessages.length;
+    }
+    const candidates = coreMessages.map((m, index) => ({ m, index })).filter(({ m, index }) => m.role === "tool" && typeof m.text === "string" && m.text.length >= cfg.minChars && !cfg.protectedTools.includes(m.toolName ?? "") && index < lastUserIdx && !ALREADY_COMPRESSED.some((marker) => m.text.includes(marker)));
+    if (candidates.length === 0) return emptyResult();
+    const budget = new Set(
+      [...candidates].sort((a, b) => b.m.text.length - a.m.text.length).slice(0, cfg.maxPerTurn).map(({ index }) => index)
+    );
+    const result = { replacements: /* @__PURE__ */ new Map(), applied: 0, savedTokens: 0, available: true };
+    const cachePrefix = `${originOf(cfg.proxyUrl)}|${modelId}|`;
+    for (const { m, index } of candidates) {
+      if (!budget.has(index)) continue;
+      const text = m.text;
+      const key = `${cachePrefix}${sha256(text)}`;
+      let entry = this.cache.get(key);
+      if (!entry) {
+        const outcome = await compressToolOutput(cfg.proxyUrl, { toolName: m.toolName ?? "", text, model: modelId, timeoutMs: cfg.timeoutMs });
+        if (!outcome || outcome.text.length >= text.length) continue;
+        entry = { text: outcome.text, tokensBefore: outcome.tokensBefore, tokensAfter: outcome.tokensAfter, hashes: outcome.hashes };
+        if (this.cache.size >= CACHE_MAX) this.cache.clear();
+        this.cache.set(key, entry);
+        await saveOriginals(entry.hashes, text);
+      }
+      result.replacements.set(m.id, entry.text);
+      result.applied += 1;
+      result.savedTokens += Math.max(0, estimate(entry.tokensBefore, text) - estimate(entry.tokensAfter, entry.text));
+    }
+    if (result.applied > 0) {
+      this.stats.applied += result.applied;
+      this.stats.savedTokens += result.savedTokens;
+      logWarn("headroom", { event: "applied", count: result.applied, savedTokens: result.savedTokens });
+    }
+    return result;
+  }
+  /** Called by host startup after its own spawn attempt so request-path
+   *  ensureProxy() never blocks on startProxy polling (up to 40s when the
+   *  binary is absent) — it only fast health-checks afterwards. */
+  markProxyAttempted() {
+    this.proxyTried = true;
+  }
+  /** Compress a single result right now (execute-time mode used by hosts
+   *  without a pre-LLM context hook). Returns the replacement text or null
+   *  when the result should pass through untouched. Never throws. */
+  async applyOne(toolName, text) {
+    const cfg = resolveHeadroom(this.getSettings());
+    if (!cfg.enabled || typeof text !== "string" || text.length < cfg.minChars) return null;
+    if (cfg.protectedTools.includes(toolName)) return null;
+    if (ALREADY_COMPRESSED.some((marker) => text.includes(marker))) return null;
+    try {
+      if (!await this.ensureProxy(cfg)) return null;
+      const outcome = await compressToolOutput(cfg.proxyUrl, { toolName, text, model: "default", timeoutMs: cfg.timeoutMs });
+      if (!outcome || outcome.text.length >= text.length) return null;
+      await saveOriginals(outcome.hashes, text);
+      const key = `${originOf(cfg.proxyUrl)}|default|${sha256(text)}`;
+      this.cache.set(key, { text: outcome.text, tokensBefore: outcome.tokensBefore, tokensAfter: outcome.tokensAfter, hashes: outcome.hashes });
+      this.stats.applied += 1;
+      this.stats.savedTokens += Math.max(0, estimate(outcome.tokensBefore, text) - estimate(outcome.tokensAfter, outcome.text));
+      return outcome.text;
+    } catch (e) {
+      logWarn("headroom", { event: "apply-one-error", error: e instanceof Error ? e.message : String(e) });
+      return null;
+    }
+  }
+  async ensureProxy(cfg) {
+    if (await proxyHealthy(cfg.proxyUrl)) return true;
+    if (cfg.autoStart && !this.proxyTried) {
+      this.proxyTried = true;
+      if (await startProxy(cfg.proxyUrl)) return true;
+    }
+    if (!this.unavailableNotified) {
+      this.unavailableNotified = true;
+      logWarn("headroom", { event: "proxy-unavailable", proxyUrl: cfg.proxyUrl, effect: "pass-through-uncompressed" });
+    }
+    return false;
+  }
+};
+function estimate(tokens, text) {
+  return tokens > 0 ? tokens : Math.ceil(text.length / 4);
+}
+function sha256(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+export {
+  DEFAULT_HEADROOM_CONFIG,
+  DEFAULT_PROTECTED_TOOLS,
+  HeadroomStage,
+  compressToolOutput,
+  invalidateHealth,
+  isValidHash,
+  originOf,
+  proxyHealthy,
+  resolveHeadroom,
+  retrieveOriginal,
+  saveOriginals,
+  startProxy,
+  stopSpawnedProxies
+};
