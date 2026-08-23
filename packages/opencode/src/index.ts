@@ -35,13 +35,34 @@ const SYSTEM_LINES = [
 	"When you need exact content from a compressed result, call headroom_retrieve with the hash from its 'Retrieve original: hash=<...>' marker.",
 ];
 
-export const AcpHeadroomPlugin: Plugin = async () => {
+export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 	const stage = new HeadroomStage(settings);
+
+	// Real provider-reported usage, refreshed on every LLM call by the
+	// messages transform (opencode gives exact numbers — no chars/4 guessing).
+	const usage = { contextTokens: 0, outputTokens: 0, cost: 0 };
 
 	return {
 		async "experimental.chat.messages.transform"(input, output) {
 			void input;
 			const msgs = output.messages;
+
+			// Real provider-reported usage: context fullness from the newest
+			// assistant message, session totals recomputed fresh each round (the
+			// transform always receives the complete projected conversation).
+			usage.contextTokens = 0;
+			usage.outputTokens = 0;
+			usage.cost = 0;
+			for (const msg of msgs) {
+				if (msg.info.role !== "assistant") continue;
+				const t = msg.info.tokens;
+				if (t) {
+					// Chronological walk ⇒ the newest assistant message wins.
+					usage.contextTokens = t.input + t.cache.read + t.cache.write;
+					usage.outputTokens += t.output;
+				}
+				usage.cost += msg.info.cost;
+			}
 
 			// Tool results after the last user message are the model's active
 			// working set — never touched.
@@ -63,6 +84,13 @@ export const AcpHeadroomPlugin: Plugin = async () => {
 
 			const result = await stage.apply(projected);
 			if (result.replacements.size === 0) return;
+
+			if (stage.stats.applied === result.applied && stage.stats.savedTokens > 0) {
+				// First compression of the session — one-time heads-up.
+				void client.tui.showToast({
+					body: { title: "ACP+Headroom", message: `Compressed ${result.applied} tool results (~${stage.stats.savedTokens} tokens saved). Use headroom_retrieve to restore originals.`, variant: "info" },
+				}).catch(() => {});
+			}
 
 			for (const msg of msgs.slice(0, lastUserIdx)) {
 				for (const part of msg.parts) {
@@ -105,6 +133,8 @@ export const AcpHeadroomPlugin: Plugin = async () => {
 						`proxy: ${originOf(cfg.proxyUrl)} (${healthy ? "healthy" : "unreachable"})`,
 						`minChars: ${cfg.minChars}, timeoutMs: ${cfg.timeoutMs}, autoStart: ${cfg.autoStart}`,
 						`session stats: ${stage.stats.applied} results compressed, ~${stage.stats.savedTokens} tokens saved`,
+						`context at last LLM call: ${usage.contextTokens} input tokens (provider-reported)`,
+						`session usage: ${usage.outputTokens} output tokens, $${usage.cost.toFixed(4)}`,
 					].join("\n");
 				},
 			}),
