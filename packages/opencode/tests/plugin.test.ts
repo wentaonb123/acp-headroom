@@ -162,6 +162,29 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(status, /minChars: 800/);
 	});
 
+	it("nudge signal appears in system prompt only under pressure", async () => {
+		const { hooks } = ctx;
+		const sysOut = { system: [] as string[] } as any;
+
+		// Comfortable zone: static lines only, no nudge.
+		await (hooks as any)["chat.params"]({ model: { id: "m", providerID: "p", limit: { context: 1_000_000 } } }, {});
+		await (hooks as any)["experimental.chat.messages.transform"]({}, {
+			messages: [{ info: { role: "assistant", cost: 0, tokens: { input: 100_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [] }],
+		} as any);
+		await (hooks as any)["experimental.chat.system.transform"]({}, sysOut);
+		assert.ok(!sysOut.system.some((l: string) => l.includes("Context pressure")), "no nudge at low pressure");
+
+		// Elevated zone (65%): nudge line injected.
+		await (hooks as any)["experimental.chat.messages.transform"]({}, {
+			messages: [{ info: { role: "assistant", cost: 0, tokens: { input: 649_000, output: 0, reasoning: 0, cache: { read: 1000, write: 0 } } }, parts: [] }],
+		} as any);
+		const sysOut2 = { system: [] as string[] } as any;
+		await (hooks as any)["experimental.chat.system.transform"]({}, sysOut2);
+		const nudge = sysOut2.system.find((l: string) => l.includes("Context pressure"));
+		assert.ok(nudge, "nudge present under elevated pressure");
+		assert.match(nudge!, /65%.*elevated/);
+	});
+
 	it("compaction hook injects hash-preservation instructions", async () => {
 		const { hooks } = ctx;
 		const output = { context: [] as string[], prompt: undefined } as any;

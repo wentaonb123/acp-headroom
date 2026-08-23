@@ -209,6 +209,17 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 		async "experimental.chat.system.transform"(input, output) {
 			void input;
 			output.system.push(...SYSTEM_LINES);
+			// Nudge signal (ACP model-driven half): when context pressure rises
+			// above the comfort zone, tell the model to actively manage context.
+			const tier = computeTier();
+			if (tier !== "normal") {
+				const pct = pressure.limit > 0 ? Math.round((usage.contextTokens / pressure.limit) * 100) : 0;
+				output.system.push(
+					`[acp-headroom] Context pressure: ${pct}% of window (${tier}). ` +
+					"Actively manage it: call headroom_compress on bulky content before echoing it into replies; " +
+					"reference CCR hash markers instead of re-pasting originals; use headroom_search to find details rather than re-reading; call headroom_status if unsure.",
+				);
+			}
 		},
 
 		async "experimental.session.compacting"(input, output) {
