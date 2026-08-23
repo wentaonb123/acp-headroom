@@ -19,19 +19,37 @@ import { compressToolOutput, HeadroomStage, originOf, proxyHealthy, resolveHeadr
  *   HEADROOM_AUTOSTART   spawn proxy if down ("0" disables, default on)
  */
 
-const settings = () => ({
-	proxyUrl: process.env.HEADROOM_PROXY_URL,
-	minChars: numEnv("HEADROOM_MIN_CHARS"),
-	// Real-kompress on large payloads routinely exceeds 3s server-side
-	// (proxy's own budget is 30s) — give it 10s by default.
-	timeoutMs: numEnv("HEADROOM_TIMEOUT_MS") ?? 10_000,
-	autoStart: process.env.HEADROOM_AUTOSTART !== "0",
-});
+const settings = () => {
+	const base = {
+		proxyUrl: process.env.HEADROOM_PROXY_URL,
+		minChars: numEnv("HEADROOM_MIN_CHARS"),
+		maxPerTurn: numEnv("HEADROOM_MAX_PER_TURN"),
+		// Real-kompress on large payloads routinely exceeds 3s server-side
+		// (proxy's own budget is 30s) — give it 10s by default.
+		timeoutMs: numEnv("HEADROOM_TIMEOUT_MS") ?? 10_000,
+		autoStart: process.env.HEADROOM_AUTOSTART !== "0",
+	};
+	// Adaptive pressure (ACP): escalate aggressiveness as the real,
+	// provider-reported context fills toward the model's window. Explicit
+	// env config always wins over escalation.
+	if (pressure.limit > 0 && base.minChars === undefined) {
+		const ratio = usage.contextTokens / pressure.limit;
+		if (ratio >= 0.8) return { ...base, minChars: 800, maxPerTurn: 24 };
+		if (ratio >= 0.6) return { ...base, minChars: 2000, maxPerTurn: 12 };
+	}
+	return base;
+};
 
 function numEnv(name: string): number | undefined {
 	const v = Number(process.env[name]);
 	return Number.isFinite(v) && v > 0 ? v : undefined;
 }
+
+// Per-instance runtime state (one plugin instance per opencode server):
+// real provider-reported usage refreshed each LLM call, plus the active
+// model's context window limit captured from chat.params.
+const usage = { contextTokens: 0, outputTokens: 0, cost: 0 };
+const pressure = { limit: 0 };
 
 const SYSTEM_LINES = [
 	"Large tool results may be mechanically compressed into short summaries carrying CCR retrieval hashes (marker formats: 'Retrieve more: hash=<hex>' or 'Retrieve original: hash=<hex>').",
@@ -47,11 +65,14 @@ const COMPACTION_LINES = [
 export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 	const stage = new HeadroomStage(settings);
 
-	// Real provider-reported usage, refreshed on every LLM call by the
-	// messages transform (opencode gives exact numbers — no chars/4 guessing).
-	const usage = { contextTokens: 0, outputTokens: 0, cost: 0 };
+	// Real provider-reported usage lives at module scope (shared with the
+	// settings() closure); see bottom of file.
 
 	return {
+		async "chat.params"(input) {
+			pressure.limit = input.model?.limit?.context ?? 0;
+		},
+
 		async "experimental.chat.messages.transform"(input, output) {
 			void input;
 			const msgs = output.messages;
@@ -186,12 +207,14 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 				async execute() {
 					const cfg = resolveHeadroom(settings());
 					const healthy = await proxyHealthy(cfg.proxyUrl);
+					const ratio = pressure.limit > 0 ? usage.contextTokens / pressure.limit : 0;
+					const tier = ratio >= 0.8 ? "aggressive" : ratio >= 0.6 ? "elevated" : "normal";
 					return [
 						`enabled: ${cfg.enabled}`,
 						`proxy: ${originOf(cfg.proxyUrl)} (${healthy ? "healthy" : "unreachable"})`,
-						`minChars: ${cfg.minChars}, timeoutMs: ${cfg.timeoutMs}, autoStart: ${cfg.autoStart}`,
+						`minChars: ${cfg.minChars}, maxPerTurn: ${cfg.maxPerTurn}, timeoutMs: ${cfg.timeoutMs}, autoStart: ${cfg.autoStart}`,
+						`context at last LLM call: ${usage.contextTokens} input tokens (provider-reported)` + (pressure.limit > 0 ? ` / ${pressure.limit} = ${(ratio * 100).toFixed(0)}% [${tier}]` : ""),
 						`session stats: ${stage.stats.applied} results compressed, ~${stage.stats.savedTokens} tokens saved`,
-						`context at last LLM call: ${usage.contextTokens} input tokens (provider-reported)`,
 						`session usage: ${usage.outputTokens} output tokens, $${usage.cost.toFixed(4)}`,
 					].join("\n");
 				},

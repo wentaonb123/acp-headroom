@@ -135,6 +135,33 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(result, /No original found/);
 	});
 
+	it("adaptive pressure escalates as context fills toward the model limit", async () => {
+		const { hooks } = ctx;
+		await (hooks as any)["chat.params"]({ model: { id: "m", providerID: "p", limit: { context: 200_000 } } }, {});
+
+		// Normal zone (30%).
+		let output = {
+			messages: [
+				{ info: { role: "assistant", cost: 0, tokens: { input: 59_500, output: 0, reasoning: 0, cache: { read: 500, write: 0 } } }, parts: [] },
+			],
+		} as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		let status = await (hooks as any).tool.headroom_status.execute({});
+		assert.match(status, /30% \[normal\]/);
+		assert.match(status, /minChars: 4000/);
+
+		// Aggressive zone (90%): minChars drops from default 4000 to 800.
+		output = {
+			messages: [
+				{ info: { role: "assistant", cost: 0, tokens: { input: 179_500, output: 0, reasoning: 0, cache: { read: 500, write: 0 } } }, parts: [] },
+			],
+		} as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		status = await (hooks as any).tool.headroom_status.execute({});
+		assert.match(status, /90% \[aggressive\]/);
+		assert.match(status, /minChars: 800/);
+	});
+
 	it("compaction hook injects hash-preservation instructions", async () => {
 		const { hooks } = ctx;
 		const output = { context: [] as string[], prompt: undefined } as any;
