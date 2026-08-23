@@ -1,0 +1,31 @@
+[acp-headroom][headroom] {"event":"applied","count":1,"savedTokens":1480}
+▶ acp-headroom-opencode plugin
+  ✔ compresses completed tool parts older than the last user message (27.929ms)
+  ✔ reports provider-reported usage in headroom_status (0.4153ms)
+  ✔ injects marker-usage instructions into the system prompt (0.2066ms)
+  ✔ headroom_retrieve fails open with a friendly message (4.2742ms)
+  ✔ adaptive pressure escalates as context fills toward the model limit (12.3344ms)
+  ✔ compaction hook injects hash-preservation instructions (0.1908ms)
+[acp-headroom][headroom] {"event":"compress-failed","error":"The operation was aborted due to timeout"}
+  ✔ tracks context composition and reports the breakdown (10017.0884ms)
+  ✔ fires a toast only when the pressure tier changes (0.3758ms)
+  ✔ headroom_compress compresses on demand and saves the original (2.7565ms)
+  ✔ headroom_search finds saved originals by keyword (2.4581ms)
+  ✔ registers exactly the four model-facing tools (0.6543ms)
+✔ acp-headroom-opencode plugin (10076.5955ms)
+ℹ Error: Test hook "before" at tests\plugin.test.ts:1:448 generated asynchronous activity after the test ended. This activity created the error "AssertionError [ERR_ASSERTION]: proxy received the original text" and would have caused the test to fail, but instead triggered an uncaughtException event.
+✖ tests\plugin.test.ts (10277.0398ms)
+ℹ tests 12
+ℹ suites 1
+ℹ pass 11
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 10283.3977
+
+✖ failing tests:
+
+test at tests\plugin.test.ts:1:1
+✖ tests\plugin.test.ts (10277.0398ms)
+  'test failed'

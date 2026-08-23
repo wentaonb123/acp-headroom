@@ -50,6 +50,32 @@ function numEnv(name: string): number | undefined {
 // model's context window limit captured from chat.params.
 const usage = { contextTokens: 0, outputTokens: 0, cost: 0 };
 const pressure = { limit: 0 };
+// Context composition: char counts by category from the last transform walk,
+// rescaled to the provider-reported total (chars/4 proportions, calibrated).
+const composition = {
+	toolUncompressed: 0,
+	ccrMarkers: 0,
+	user: 0,
+	assistant: 0,
+	other: 0,
+	totalTokens: 0,
+};
+let lastTier: string | null = null;
+
+function computeTier(): string {
+	if (pressure.limit <= 0 || usage.contextTokens <= 0) return "normal";
+	const ratio = usage.contextTokens / pressure.limit;
+	return ratio >= 0.8 ? "aggressive" : ratio >= 0.6 ? "elevated" : "normal";
+}
+
+function resetComposition(): void {
+	composition.toolUncompressed = 0;
+	composition.ccrMarkers = 0;
+	composition.user = 0;
+	composition.assistant = 0;
+	composition.other = 0;
+	composition.totalTokens = 0;
+}
 
 const SYSTEM_LINES = [
 	"Large tool results may be mechanically compressed into short summaries carrying CCR retrieval hashes (marker formats: 'Retrieve more: hash=<hex>' or 'Retrieve original: hash=<hex>').",
@@ -77,22 +103,64 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			void input;
 			const msgs = output.messages;
 
-			// Real provider-reported usage: context fullness from the newest
-			// assistant message, session totals recomputed fresh each round (the
-			// transform always receives the complete projected conversation).
+			// Real provider-reported usage + composition, recomputed fresh each
+			// round (the transform always receives the complete projection).
 			usage.contextTokens = 0;
 			usage.outputTokens = 0;
 			usage.cost = 0;
+			resetComposition();
+			let estChars = 0;
 			for (const msg of msgs) {
-				if (msg.info.role !== "assistant") continue;
-				const t = msg.info.tokens;
-				if (t) {
-					// Chronological walk ⇒ the newest assistant message wins.
-					usage.contextTokens = t.input + t.cache.read + t.cache.write;
-					usage.outputTokens += t.output;
+				const role = msg.info.role;
+				if (role === "assistant") {
+					const t = msg.info.tokens;
+					if (t) {
+						// Chronological walk ⇒ the newest assistant message wins.
+						usage.contextTokens = t.input + t.cache.read + t.cache.write;
+						usage.outputTokens += t.output;
+					}
+					usage.cost += msg.info.cost;
 				}
-				usage.cost += msg.info.cost;
+				for (const part of msg.parts ?? []) {
+					if (part.type === "tool") {
+						const out = part.state?.status === "completed" ? part.state.output : undefined;
+						if (typeof out !== "string") { composition.other += 40; continue; }
+						if (out.includes("Retrieve more: hash=") || out.includes("Retrieve original: hash=")) composition.ccrMarkers += out.length;
+						else composition.toolUncompressed += out.length;
+						continue;
+					}
+					const textLen = typeof (part as { text?: unknown }).text === "string" ? ((part as { text: string }).text.length) : 0;
+					if (role === "user") composition.user += textLen || 20;
+					else if (role === "assistant") composition.assistant += textLen;
+					else composition.other += textLen;
+				}
 			}
+			estChars = Math.round((composition.toolUncompressed + composition.ccrMarkers + composition.user + composition.assistant + composition.other) / 4);
+			if (estChars > 0 && usage.contextTokens > 0) {
+				const scale = usage.contextTokens / estChars;
+				composition.toolUncompressed = Math.round((composition.toolUncompressed / 4) * scale);
+				composition.ccrMarkers = Math.round((composition.ccrMarkers / 4) * scale);
+				composition.user = Math.round((composition.user / 4) * scale);
+				composition.assistant = Math.round((composition.assistant / 4) * scale);
+				composition.other = Math.round((composition.other / 4) * scale);
+				composition.totalTokens = usage.contextTokens;
+			}
+
+			// Pressure-tier transition toast — fires only when the tier actually
+			// changes (never on the first round), with a one-line composition.
+			const tier = computeTier();
+			if (lastTier !== null && tier !== lastTier && pressure.limit > 0) {
+				const pct = Math.round((usage.contextTokens / pressure.limit) * 100);
+				const toolPct = composition.totalTokens > 0 ? Math.round(((composition.toolUncompressed + composition.ccrMarkers) / composition.totalTokens) * 100) : 0;
+				void client.tui.showToast({
+					body: {
+						title: `ACP+Headroom: ${tier}`,
+						message: `Context at ${pct}% of window; tool results take ~${toolPct}% (${composition.totalTokens.toLocaleString()} tokens). Compression now more aggressive.`,
+						variant: tier === "aggressive" ? "warning" : "info",
+					},
+				}).catch(() => {});
+			}
+			lastTier = tier;
 
 			// Tool results after the last user message are the model's active
 			// working set — never touched.
@@ -208,15 +276,28 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 					const cfg = resolveHeadroom(settings());
 					const healthy = await proxyHealthy(cfg.proxyUrl);
 					const ratio = pressure.limit > 0 ? usage.contextTokens / pressure.limit : 0;
-					const tier = ratio >= 0.8 ? "aggressive" : ratio >= 0.6 ? "elevated" : "normal";
-					return [
+					const tier = computeTier();
+					const fmtK = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
+					const lines = [
 						`enabled: ${cfg.enabled}`,
 						`proxy: ${originOf(cfg.proxyUrl)} (${healthy ? "healthy" : "unreachable"})`,
 						`minChars: ${cfg.minChars}, maxPerTurn: ${cfg.maxPerTurn}, timeoutMs: ${cfg.timeoutMs}, autoStart: ${cfg.autoStart}`,
 						`context at last LLM call: ${usage.contextTokens} input tokens (provider-reported)` + (pressure.limit > 0 ? ` / ${pressure.limit} = ${(ratio * 100).toFixed(0)}% [${tier}]` : ""),
 						`session stats: ${stage.stats.applied} results compressed, ~${stage.stats.savedTokens} tokens saved`,
 						`session usage: ${usage.outputTokens} output tokens, $${usage.cost.toFixed(4)}`,
-					].join("\n");
+					];
+					if (composition.totalTokens > 0) {
+						const pct = (n: number) => Math.round((n / composition.totalTokens) * 100);
+						lines.push(
+							"context breakdown (est.):",
+							`  tool results  ${fmtK(composition.toolUncompressed)} (${pct(composition.toolUncompressed)}%)`,
+							`  ccr markers   ${fmtK(composition.ccrMarkers)} (${pct(composition.ccrMarkers)}%)`,
+							`  user msgs     ${fmtK(composition.user)} (${pct(composition.user)}%)`,
+							`  assistant     ${fmtK(composition.assistant)} (${pct(composition.assistant)}%)`,
+							`  other         ${fmtK(composition.other)} (${pct(composition.other)}%)`,
+						);
+					}
+					return lines.join("\n");
 				},
 			}),
 		},
