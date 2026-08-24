@@ -27,9 +27,12 @@ uv tool run --from "headroom-ai[proxy]" headroom proxy --port 8787
 - **Tools**: `headroom_retrieve(hash)` pulls back exact originals; `headroom_search(query)` full-text search across all saved originals; `headroom_compress(text)` compress on demand; `headroom_status()` reports savings with real provider-reported token usage.
 - **Fail-open**: proxy down ⇒ everything passes through uncompressed.
 
-## Slash command (optional)
+## Slash command
 
-Copy `commands/headroom-status.md` to `~/.config/opencode/command/` to get a `/headroom-status` command.
+`/headroom-status` is registered by the plugin itself and renders **instantly
+with zero LLM involvement** (empty-template command + `command.execute.before`
+interception). `/headroom-search` and `/headroom-retrieve` remain prompt-based
+on purpose — their output belongs in the model's context.
 
 ## Config
 
