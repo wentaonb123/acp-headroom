@@ -39,4 +39,22 @@ HEADROOM_MIN_CHARS=4000                    # min result size
 HEADROOM_AUTOSTART=0                       # disable auto-spawn
 ```
 
+Folded-range state persists per session at
+`~/.local/share/opencode/storage/plugin/acp-headroom/<sessionID>.json`
+(XDG-aware; `HEADROOM_RANGES_DIR` overrides), so context stays compressed
+across restarts.
+
+## Cost model — read this before using acp_compress heavily
+
+Range compression rewrites history, which invalidates the provider's prompt
+cache for that call — **each fold event bills the full tail once**. The economics:
+
+- ✅ **Low-frequency, large batches** (the intended use): one invalidation,
+  then every later call saves ~60% input at warm cache — pays back in a few turns.
+- ❌ **Repeated small folds**: multiple full-price calls for near-zero savings.
+
+Rules of thumb: fold only fully-consumed stretches, batch ranges in one call,
+and leave the recent working set alone. The GC safety net evicts old summaries
+automatically at 95% of the window, so summary overhead never compounds.
+
 MIT © wentaonb123

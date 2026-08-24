@@ -72,19 +72,47 @@ const pressure = { limit: 0 };
 const acpState = {
 	nextRef: 1,
 	refByInfo: new Map<string, number>(),
-	ranges: [] as Array<{ start: number; end: number; summary: string }>,
+	ranges: [] as Array<{ start: number; end: number; summary: string; truncated?: boolean }>,
 	sessionId: "",
 	loadedFor: "",
 };
+
+// --- Backlog adopted from opencode-acp source review ---
+// GC safety net: at 95% of the window, evict the OLDEST folded summaries
+// (keep the 2 newest) so total summary overhead stays bounded even in
+// month-scale sessions. Eviction persists (truncated flag) and folding
+// renders evicted ranges as one-liners — hashes are re-collectable via
+// headroom_search over disk backups, so nothing becomes unrecoverable.
+const GC_RATIO = 0.95;
+const GC_KEEP_NEWEST = 2;
+
+function gcEvictOldestAnchors(): void {
+	if (pressure.limit <= 0 || usage.contextTokens <= 0) return;
+	if (usage.contextTokens / pressure.limit < GC_RATIO) return;
+	let changed = false;
+	for (const r of acpState.ranges.slice(0, Math.max(0, acpState.ranges.length - GC_KEEP_NEWEST))) {
+		if (!r.truncated) {
+			r.truncated = true;
+			changed = true;
+		}
+	}
+	if (changed) void saveRanges();
+}
 
 // Range persistence: folds survive opencode restarts (pi persists compressed
 // blocks too — without this, every restart re-inflates context back to the
 // pre-fold size). Keyed per session; refs are positional and stable for
 // unchanged history, so restored ranges keep pointing at the right messages.
-// ponytail: stale session files are KB-scale — no GC; add cleanup only if the
-// ranges dir ever matters on disk.
+// Storage lives inside opencode's own data tree (XDG-aware), matching where
+// the host keeps per-session plugin state.
 function rangesDir(): string {
-	return path.resolve(process.env.HEADROOM_RANGES_DIR ?? path.join(homedir(), ".acp-headroom", "ranges"));
+	if (process.env.HEADROOM_RANGES_DIR) return path.resolve(process.env.HEADROOM_RANGES_DIR);
+	const dataHome = process.env.XDG_DATA_HOME ?? path.join(homedir(), ".local", "share");
+	return path.join(dataHome, "opencode", "storage", "plugin", "acp-headroom");
+}
+
+function legacyRangesDir(): string {
+	return path.join(homedir(), ".acp-headroom", "ranges");
 }
 
 async function loadRanges(sessionId: string): Promise<void> {
@@ -92,22 +120,36 @@ async function loadRanges(sessionId: string): Promise<void> {
 	acpState.loadedFor = sessionId;
 	// Disk truth replaces in-memory state wholesale — otherwise a session
 	// without a persisted file would inherit the previous session's folds.
-	const ranges: Array<{ start: number; end: number; summary: string }> = [];
+	const ranges: Array<{ start: number; end: number; summary: string; truncated?: boolean }> = [];
 	let next = 1;
+	let raw: string | undefined;
 	try {
-		const raw = await fs.readFile(path.join(rangesDir(), `${sessionId}.json`), "utf8");
-		const data = JSON.parse(raw) as { nextRef?: unknown; ranges?: Array<{ start?: unknown; end?: unknown; summary?: unknown }> };
-		if (Array.isArray(data.ranges)) {
-			for (const r of data.ranges) {
-				if (typeof r.start === "number" && typeof r.end === "number" && typeof r.summary === "string") {
-					ranges.push({ start: r.start, end: r.end, summary: r.summary });
-					next = Math.max(next, r.end + 1);
-				}
-			}
-			if (typeof data.nextRef === "number") next = Math.max(next, data.nextRef);
-		}
+		raw = await fs.readFile(path.join(rangesDir(), `${sessionId}.json`), "utf8");
 	} catch {
-		// missing/corrupt file → fresh empty state (fail-open)
+		// One-time migration from the pre-0.2.4 location (~/.acp-headroom/ranges).
+		try {
+			raw = await fs.readFile(path.join(legacyRangesDir(), `${sessionId}.json`), "utf8");
+			await fs.mkdir(rangesDir(), { recursive: true });
+			await fs.writeFile(path.join(rangesDir(), `${sessionId}.json`), raw, "utf8");
+		} catch {
+			raw = undefined;
+		}
+	}
+	if (raw !== undefined) {
+		try {
+			const data = JSON.parse(raw) as { nextRef?: unknown; ranges?: Array<{ start?: unknown; end?: unknown; summary?: unknown; truncated?: unknown }> };
+			if (Array.isArray(data.ranges)) {
+				for (const r of data.ranges) {
+					if (typeof r.start === "number" && typeof r.end === "number" && typeof r.summary === "string") {
+						ranges.push({ start: r.start, end: r.end, summary: r.summary, truncated: r.truncated === true ? true : undefined });
+						next = Math.max(next, r.end + 1);
+					}
+				}
+				if (typeof data.nextRef === "number") next = Math.max(next, data.nextRef);
+			}
+		} catch {
+			// corrupt file → fresh empty state (fail-open)
+		}
 	}
 	acpState.ranges = ranges;
 	acpState.nextRef = Math.max(acpState.nextRef, next);
@@ -133,7 +175,13 @@ const composition = {
 	other: 0,
 	totalTokens: 0,
 };
-let lastTier: string | null = null;
+let lastTier: number | null = null; // severity index of the last toast (0/1/2)
+let lastToastTokens = 0;
+// Nudge damping: re-inject only when the tier changes OR context grew ≥10%
+// of the window since the last injection — mirrors opencode-acp's anchored
+// nudge bookkeeping without the full anchor machinery.
+let lastNudgeTier = "";
+let lastNudgeTokens = 0;
 
 function computeTier(): string {
 	if (pressure.limit <= 0 || usage.contextTokens <= 0) return "normal";
@@ -243,10 +291,21 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 				composition.totalTokens = usage.contextTokens;
 			}
 
+			// GC safety net before folding: at ≥95% of the window, evict oldest
+			// summaries so this round's anchors render as one-liners.
+			gcEvictOldestAnchors();
+
 			// Pressure-tier transition toast — fires only when the tier actually
-			// changes (never on the first round), with a one-line composition.
+			// worsens AND context grew ≥2% of the window since the last toast
+			// (damped: no oscillation spam around a band boundary).
 			const tier = computeTier();
-			if (lastTier !== null && tier !== lastTier && pressure.limit > 0) {
+			const severity = tier === "aggressive" ? 2 : tier === "elevated" ? 1 : 0;
+			if (
+				lastTier !== null &&
+				severity > lastTier &&
+				usage.contextTokens - lastToastTokens >= pressure.limit * 0.02
+			) {
+				lastToastTokens = usage.contextTokens;
 				const pct = Math.round((usage.contextTokens / pressure.limit) * 100);
 				const toolPct = composition.totalTokens > 0 ? Math.round(((composition.toolUncompressed + composition.ccrMarkers) / composition.totalTokens) * 100) : 0;
 				void client.tui.showToast({
@@ -257,7 +316,7 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 					},
 				}).catch(() => {});
 			}
-			lastTier = tier;
+			lastTier = severity;
 
 			// Tool results after the last user message are the model's active
 			// working set — never touched.
@@ -335,7 +394,8 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			for (const r of acpState.ranges) {
 				// Pass 1: collect in-range parts and every CCR hash found in tool
 				// outputs — folding must NOT orphan those retrieval paths (pi keeps
-				// hash references alive in summaries too).
+				// hash references alive in summaries too). GC-evicted ranges render
+				// as one-liners; their originals stay recoverable via headroom_search.
 				const hashes = new Set<string>();
 				const inRange: Array<{ kind: "tool" | "text"; tool?: ToolPart; textPart?: { text?: unknown } }> = [];
 				for (let i = 0; i < lastUserIdx; i++) {
@@ -345,7 +405,11 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 						if (part.type === "tool") {
 							if (part.state?.status === "completed") {
 								inRange.push({ kind: "tool", tool: part as ToolPart });
-								for (const h of (part.state.output as string).matchAll(/[a-f0-9]{12,24}/gi)) hashes.add(h[0].toLowerCase());
+								if (!r.truncated) {
+									for (const h of ((part.state as { output?: unknown }).output as string | undefined)?.matchAll(/[a-f0-9]{12,24}/gi) ?? []) {
+										hashes.add(h[0].toLowerCase());
+									}
+								}
 							}
 							continue;
 						}
@@ -354,23 +418,24 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 					}
 				}
 				// Pass 2: anchor carries the model's summary plus surviving hashes.
-				const suffix = hashes.size > 0 ? ` (retrievable via headroom_retrieve: ${Array.from(hashes).slice(0, 20).join(", ")})` : "";
+				const sumText = r.truncated ? "(summary evicted; originals via headroom_search)" : r.summary;
+				const suffix = !r.truncated && hashes.size > 0 ? ` (retrievable via headroom_retrieve: ${Array.from(hashes).slice(0, 20).join(", ")})` : "";
 				let anchored = false;
 				for (const item of inRange) {
 					if (item.kind === "tool") {
 						(item.tool!.state as { output: string }).output = `[m${r.start}..m${r.end} folded]`;
 						continue;
 					}
-					item.textPart!.text = anchored ? "" : `[m${r.start}..m${r.end} compressed] ${r.summary}${suffix}`;
+					item.textPart!.text = anchored ? "" : `[m${r.start}..m${r.end} compressed] ${sumText}${suffix}`;
 					anchored = true;
 				}
 				// Tool-only range: no text part carried the anchor — park it on
 				// the first folded result so summary + hashes stay visible.
-				if (!anchored && hashes.size >= 0) {
+				if (!anchored) {
 					const firstTool = inRange.find((i2) => i2.kind === "tool");
 					if (firstTool) {
 						(firstTool.tool!.state as { output: string }).output =
-							`[m${r.start}..m${r.end} compressed] ${r.summary}${suffix}`;
+							`[m${r.start}..m${r.end} compressed] ${sumText}${suffix}`;
 					}
 				}
 			}
@@ -381,8 +446,14 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			output.system.push(...SYSTEM_LINES);
 			// Nudge signal (ACP model-driven half): when context pressure rises
 			// above the comfort zone, tell the model to actively manage context.
+			// Damped: same tier re-injects only after ≥10% window growth.
 			const tier = computeTier();
-			if (tier !== "normal") {
+			if (
+				tier !== "normal" &&
+				(tier !== lastNudgeTier || usage.contextTokens - lastNudgeTokens >= pressure.limit * 0.1)
+			) {
+				lastNudgeTier = tier;
+				lastNudgeTokens = usage.contextTokens;
 				const pct = pressure.limit > 0 ? Math.round((usage.contextTokens / pressure.limit) * 100) : 0;
 				output.system.push(
 					`[acp-headroom] Context pressure: ${pct}% of window (${tier}). ` +
@@ -406,6 +477,8 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 					acpState.refByInfo.clear();
 					acpState.ranges.length = 0;
 					acpState.loadedFor = ""; // next chat.params reloads (empty) from disk
+					lastNudgeTier = "";
+					lastNudgeTokens = 0;
 				}
 			},
 
