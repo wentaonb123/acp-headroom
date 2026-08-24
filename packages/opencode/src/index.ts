@@ -221,6 +221,35 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 	// Real provider-reported usage lives at module scope (shared with the
 	// settings() closure); see bottom of file.
 
+	const renderStatus = async (): Promise<string> => {
+		const cfg = resolveHeadroom(settings());
+		const healthy = await proxyHealthy(cfg.proxyUrl);
+		const ratio = pressure.limit > 0 ? usage.contextTokens / pressure.limit : 0;
+		const tier = computeTier();
+		const fmtK = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
+		const lines = [
+			`enabled: ${cfg.enabled}`,
+			`proxy: ${originOf(cfg.proxyUrl)} (${healthy ? "healthy" : "unreachable"})`,
+			`minChars: ${cfg.minChars}, maxPerTurn: ${cfg.maxPerTurn}, timeoutMs: ${cfg.timeoutMs}, autoStart: ${cfg.autoStart}`,
+			`context at last LLM call: ${usage.contextTokens} input tokens (provider-reported)` + (pressure.limit > 0 ? ` / ${pressure.limit} = ${(ratio * 100).toFixed(0)}% [${tier}]` : ""),
+			`session stats: ${stage.stats.applied} results compressed, ~${stage.stats.savedTokens} tokens saved`,
+			`acp ranges folded: ${acpState.ranges.length}`,
+			`session usage: ${usage.outputTokens} output tokens, $${usage.cost.toFixed(4)}`,
+		];
+		if (composition.totalTokens > 0) {
+			const pct = (n: number) => Math.round((n / composition.totalTokens) * 100);
+			lines.push(
+				"context breakdown (est.):",
+				`  tool results  ${fmtK(composition.toolUncompressed)} (${pct(composition.toolUncompressed)}%)`,
+				`  ccr markers   ${fmtK(composition.ccrMarkers)} (${pct(composition.ccrMarkers)}%)`,
+				`  user msgs     ${fmtK(composition.user)} (${pct(composition.user)}%)`,
+				`  assistant     ${fmtK(composition.assistant)} (${pct(composition.assistant)}%)`,
+				`  other         ${fmtK(composition.other)} (${pct(composition.other)}%)`,
+			);
+		}
+		return lines.join("\n");
+	};
+
 	return {
 		async "chat.params"(input) {
 			acpState.sessionId = input.sessionID ?? "";
@@ -470,7 +499,30 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			output.context.push(...COMPACTION_LINES);
 		},
 
-			async event({ event }) {
+			config: async (opencodeConfig) => {
+			opencodeConfig.command ??= {};
+			opencodeConfig.command["headroom-status"] = {
+				template: "",
+				description: "ACP+Headroom status (instant, no LLM)",
+			};
+		},
+
+		async "command.execute.before"(input) {
+			if (input.command !== "headroom-status") return;
+			// Zero-LLM command (opencode-acp dialect): render directly from
+			// plugin state, inject as a noReply message, then abort the normal
+			// pipeline — no model roundtrip, instant output.
+			const text = await renderStatus();
+			void client.session
+				.prompt({
+					path: { id: input.sessionID },
+					body: { noReply: true, parts: [{ type: "text", text }] },
+				})
+				.catch(() => {});
+			throw new Error("__ACP_HEADROOM_HANDLED__");
+		},
+
+		async event({ event }) {
 				if (event.type === "session.created") {
 					stage.resetSession();
 					acpState.nextRef = 1;
@@ -589,34 +641,7 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 			headroom_status: tool({
 				description: "Report ACP+Headroom compression status: proxy reachability, results compressed this session, estimated tokens saved.",
 				args: {},
-				async execute() {
-					const cfg = resolveHeadroom(settings());
-					const healthy = await proxyHealthy(cfg.proxyUrl);
-					const ratio = pressure.limit > 0 ? usage.contextTokens / pressure.limit : 0;
-					const tier = computeTier();
-					const fmtK = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
-					const lines = [
-						`enabled: ${cfg.enabled}`,
-						`proxy: ${originOf(cfg.proxyUrl)} (${healthy ? "healthy" : "unreachable"})`,
-						`minChars: ${cfg.minChars}, maxPerTurn: ${cfg.maxPerTurn}, timeoutMs: ${cfg.timeoutMs}, autoStart: ${cfg.autoStart}`,
-						`context at last LLM call: ${usage.contextTokens} input tokens (provider-reported)` + (pressure.limit > 0 ? ` / ${pressure.limit} = ${(ratio * 100).toFixed(0)}% [${tier}]` : ""),
-						`session stats: ${stage.stats.applied} results compressed, ~${stage.stats.savedTokens} tokens saved`,
-						`acp ranges folded: ${acpState.ranges.length}`,
-						`session usage: ${usage.outputTokens} output tokens, $${usage.cost.toFixed(4)}`,
-					];
-					if (composition.totalTokens > 0) {
-						const pct = (n: number) => Math.round((n / composition.totalTokens) * 100);
-						lines.push(
-							"context breakdown (est.):",
-							`  tool results  ${fmtK(composition.toolUncompressed)} (${pct(composition.toolUncompressed)}%)`,
-							`  ccr markers   ${fmtK(composition.ccrMarkers)} (${pct(composition.ccrMarkers)}%)`,
-							`  user msgs     ${fmtK(composition.user)} (${pct(composition.user)}%)`,
-							`  assistant     ${fmtK(composition.assistant)} (${pct(composition.assistant)}%)`,
-							`  other         ${fmtK(composition.other)} (${pct(composition.other)}%)`,
-						);
-					}
-					return lines.join("\n");
-				},
+				execute: renderStatus,
 			}),
 		},
 	};

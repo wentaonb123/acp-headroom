@@ -366,6 +366,34 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.equal(countNudges(s), 1, "nudge refreshed after growth");
 	});
 
+	it("zero-LLM /headroom-status command renders directly and aborts pipeline", async () => {
+		const { hooks } = ctx;
+		await (hooks as any).config?.({ command: {} });
+		const prompts: any[] = [];
+		const hooks2 = await AcpHeadroomPlugin({
+			client: {
+				tui: { showToast: async () => {} },
+				session: { prompt: async (opts: any) => { prompts.push(opts); } },
+			},
+			project: {} as any,
+			directory: ".",
+			worktree: ".",
+			$: {} as any,
+			serverUrl: new URL("http://127.0.0.1:1"),
+		} as any);
+		await (hooks2 as any).config({ command: {} });
+		let aborted = false;
+		try {
+			await (hooks2 as any)["command.execute.before"]({ command: "headroom-status", sessionID: "s-cmd" }, { parts: [] });
+		} catch (e: any) {
+			aborted = e?.message === "__ACP_HEADROOM_HANDLED__";
+		}
+		assert.ok(aborted, "pipeline aborted with sentinel");
+		assert.equal(prompts.length, 1);
+		assert.equal(prompts[0].body.noReply, true);
+		assert.match(prompts[0].body.parts[0].text, /enabled: true/);
+	});
+
 	it("persists acp ranges to disk and restores them per session", async () => {
 		const { hooks } = ctx;
 		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });
