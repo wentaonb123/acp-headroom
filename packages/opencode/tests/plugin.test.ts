@@ -394,6 +394,46 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(prompts[0].body.parts[0].text, /enabled: true/);
 	});
 
+	it("ref registry persists — refs stay stable even when history shifts", async () => {
+		const { hooks } = ctx;
+		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });
+		const output = { messages: [mk("rr1"), mk("rr2"), { info: { role: "user" }, parts: [] }] } as any;
+		await (hooks as any)["chat.params"]({ sessionID: "ref-stable", model: { id: "m", providerID: "p", limit: { context: 1_000_000 } } }, {});
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		const r1 = Number(/\[m(\d+)\]/.exec(output.messages[0].parts[0].text)![1]);
+		const r2 = Number(/\[m(\d+)\]/.exec(output.messages[1].parts[0].text)![1]);
+		await (hooks as any).tool.acp_compress.execute({ from: `m${r1}`, to: `m${r2}`, summary: "Ref stability check with plenty of detail." });
+
+		// Reload session WITH a shifted projection (an extra message inserted
+		// before rr1, simulating compaction artifacts): restored registry must
+		// keep rr1/rr2 on their original refs instead of positional re-assign.
+		await (hooks as any)["chat.params"]({ sessionID: "ref-stable", model: { id: "m", providerID: "p", limit: { context: 1_000_000 } } }, {});
+		const shifted = {
+			messages: [
+				mk("extra-newcomer"),
+				mk("rr1"),
+				mk("rr2"),
+				{ info: { role: "user" }, parts: [] },
+			],
+		} as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, shifted);
+		// The restored range folds using the ORIGINAL refs (registry survived),
+		// so the anchor lands on rr1 carrying exactly the old span numbers.
+		assert.match(shifted.messages[1].parts[0].text, new RegExp(`\\[m${r1}\\.\\.m${r2} compressed\\] Ref stability check`), "original refs kept despite shift");
+		assert.match(shifted.messages[0].parts[0].text, /^\[m\d+\] content of extra-newcomer$/, "new message gets a fresh ref");
+	});
+
+	it("acp_compress warns on suspiciously thin summaries", async () => {
+		const { hooks } = ctx;
+		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });
+		const output = { messages: [mk("tw1"), mk("tw2"), { info: { role: "user" }, parts: [] }] } as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		const r1 = Number(/\[m(\d+)\]/.exec(output.messages[0].parts[0].text)![1]);
+		const result = await (hooks as any).tool.acp_compress.execute({ from: `m${r1}`, to: `m${r1}`, summary: "thin" });
+		assert.match(result, /✓ m\d+(\.\.m\d+)? folded \(1 messages\)/);
+		assert.match(result, /⚠ summary under 50 chars/);
+	});
+
 	it("persists acp ranges to disk and restores them per session", async () => {
 		const { hooks } = ctx;
 		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });

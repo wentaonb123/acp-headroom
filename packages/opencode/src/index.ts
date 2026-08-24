@@ -137,7 +137,23 @@ async function loadRanges(sessionId: string): Promise<void> {
 	}
 	if (raw !== undefined) {
 		try {
-			const data = JSON.parse(raw) as { nextRef?: unknown; ranges?: Array<{ start?: unknown; end?: unknown; summary?: unknown; truncated?: unknown }> };
+			const data = JSON.parse(raw) as {
+				nextRef?: unknown;
+				ranges?: Array<{ start?: unknown; end?: unknown; summary?: unknown; truncated?: unknown }>;
+				refs?: Record<string, unknown>;
+			};
+			// Restore the ref↔messageId registry so ranges stay anchored to the
+			// SAME messages even when opencode's native compaction has removed
+			// old entries from the projection (positional re-assignment would
+			// silently shift every ref and fold the wrong spans).
+			if (data.refs && typeof data.refs === "object") {
+				for (const [infoId, ref] of Object.entries(data.refs)) {
+					if (typeof ref === "number" && Number.isInteger(ref) && ref >= 1 && infoId.length > 0) {
+						acpState.refByInfo.set(infoId, ref);
+						next = Math.max(next, ref + 1);
+					}
+				}
+			}
 			if (Array.isArray(data.ranges)) {
 				for (const r of data.ranges) {
 					if (typeof r.start === "number" && typeof r.end === "number" && typeof r.summary === "string") {
@@ -160,7 +176,11 @@ async function saveRanges(): Promise<void> {
 	try {
 		const dir = rangesDir();
 		await fs.mkdir(dir, { recursive: true });
-		await fs.writeFile(path.join(dir, `${acpState.sessionId}.json`), JSON.stringify({ nextRef: acpState.nextRef, ranges: acpState.ranges }), "utf8");
+		await fs.writeFile(
+			path.join(dir, `${acpState.sessionId}.json`),
+			JSON.stringify({ nextRef: acpState.nextRef, ranges: acpState.ranges, refs: Object.fromEntries(acpState.refByInfo) }),
+			"utf8",
+		);
 	} catch {
 		// fail-open: folding still works this round even if persistence failed
 	}
@@ -541,7 +561,8 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 		tool: {
 			acp_compress: tool({
 				description:
-					"Compress contiguous ranges of OLDER conversation messages into summaries you write. Reference messages by their [mN] tags (from/to inclusive). Pass `ranges` to fold several consumed stretches in ONE call (saves intermediate inference rounds), or the single from/to/summary form. Use when a whole stretch is consumed — finished explorations, resolved threads, completed phases. Never include the current working set or verbatim-critical user instructions.",
+					"Compress contiguous ranges of OLDER conversation messages into summaries you write. Reference messages by their [mN] tags (from/to inclusive). Pass `ranges` to fold several consumed stretches in ONE call (saves intermediate inference rounds), or the single from/to/summary form. Use when a whole stretch is consumed — finished explorations, resolved threads, completed phases. Never include the current working set or verbatim-critical user instructions. " +
+					"Compression priority: agent/subagent review results > verbose build/test/git output > dead-end exploration > redundant re-reads > intermediate steps of finished tasks; preserve file paths, signatures, decisions and rationale in every summary.",
 				args: {
 					ranges: tool.schema
 						.array(
@@ -586,9 +607,14 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 						for (const ref of acpState.refByInfo.values()) {
 							if (ref >= start && ref <= end) count++;
 						}
-						acpState.ranges.push({ start, end, summary: r.summary });
-					await saveRanges();
-						results.push(`✓ ${r.from}..${r.to} folded (${count} messages)`);
+					acpState.ranges.push({ start, end, summary: r.summary });
+						await saveRanges();
+						results.push(
+							`✓ ${r.from}..${r.to} folded (${count} messages)` +
+							// Quality floor (opencode-acp L1 dialect): non-blocking warn
+							// on suspiciously thin summaries — the fold stands either way.
+							(r.summary.trim().length < 50 ? "\n  ⚠ summary under 50 chars — likely lost key decisions/paths; consider re-folding with a fuller summary." : ""),
+						);
 					}
 					// Natural distillation: folding a range that overlaps earlier
 					// ranges swallows them — no explicit tier machinery needed.
