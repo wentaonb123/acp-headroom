@@ -281,6 +281,19 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(status, /acp ranges folded: [2-9]/); // prior test's fold + these two
 	});
 
+	it("range folding preserves retrievable CCR hashes in the anchor", async () => {
+		const { hooks } = ctx;
+		const mkTool = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "tool", tool: "bash", state: { status: "completed", input: {}, output: `[headroom] Retrieve more: hash=aabbccddeeff11223344`, title: "bash", metadata: {}, time: { start: 0, end: 1 } } }] });
+		const output = { messages: [mkTool("hh1"), mkTool("hh2"), { info: { role: "user" }, parts: [] }] } as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		const r1 = Number(/\[m(\d+)\]/.exec(output.messages[0].parts[0].state.output)![1]);
+		const r2 = Number(/\[m(\d+)\]/.exec(output.messages[1].parts[0].state.output)![1]);
+		await (hooks as any).tool.acp_compress.execute({ from: `m${r1}`, to: `m${r2}`, summary: "Hash survival check." });
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		// Tool-only range: anchor lands on the first folded tool result.
+		assert.match(output.messages[0].parts[0].state.output, /compressed\] Hash survival check\. \(retrievable via headroom_retrieve: aabbccddeeff11223344\)/);
+	});
+
 	it("persists acp ranges to disk and restores them per session", async () => {
 		const { hooks } = ctx;
 		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });

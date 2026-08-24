@@ -322,19 +322,44 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 				}
 			}
 			for (const r of acpState.ranges) {
-				let anchored = false;
+				// Pass 1: collect in-range parts and every CCR hash found in tool
+				// outputs — folding must NOT orphan those retrieval paths (pi keeps
+				// hash references alive in summaries too).
+				const hashes = new Set<string>();
+				const inRange: Array<{ kind: "tool" | "text"; tool?: ToolPart; textPart?: { text?: unknown } }> = [];
 				for (let i = 0; i < lastUserIdx; i++) {
 					const ref = refOf(i);
 					if (ref === undefined || ref < r.start || ref > r.end) continue;
 					for (const part of msgs[i]!.parts ?? []) {
 						if (part.type === "tool") {
-							if (part.state?.status === "completed") part.state.output = `[m${r.start}..m${r.end} folded]`;
+							if (part.state?.status === "completed") {
+								inRange.push({ kind: "tool", tool: part as ToolPart });
+								for (const h of (part.state.output as string).matchAll(/[a-f0-9]{12,24}/gi)) hashes.add(h[0].toLowerCase());
+							}
 							continue;
 						}
 						const p = part as { text?: unknown };
-						if (typeof p.text !== "string") continue;
-						p.text = anchored ? "" : `[m${r.start}..m${r.end} compressed] ${r.summary}`;
-						anchored = true;
+						if (typeof p.text === "string") inRange.push({ kind: "text", textPart: p });
+					}
+				}
+				// Pass 2: anchor carries the model's summary plus surviving hashes.
+				const suffix = hashes.size > 0 ? ` (retrievable via headroom_retrieve: ${Array.from(hashes).slice(0, 20).join(", ")})` : "";
+				let anchored = false;
+				for (const item of inRange) {
+					if (item.kind === "tool") {
+						(item.tool!.state as { output: string }).output = `[m${r.start}..m${r.end} folded]`;
+						continue;
+					}
+					item.textPart!.text = anchored ? "" : `[m${r.start}..m${r.end} compressed] ${r.summary}${suffix}`;
+					anchored = true;
+				}
+				// Tool-only range: no text part carried the anchor — park it on
+				// the first folded result so summary + hashes stay visible.
+				if (!anchored && hashes.size >= 0) {
+					const firstTool = inRange.find((i2) => i2.kind === "tool");
+					if (firstTool) {
+						(firstTool.tool!.state as { output: string }).output =
+							`[m${r.start}..m${r.end} compressed] ${r.summary}${suffix}`;
 					}
 				}
 			}
