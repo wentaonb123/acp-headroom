@@ -294,6 +294,17 @@ describe("acp-headroom-opencode plugin", () => {
 		assert.match(output.messages[0].parts[0].state.output, /compressed\] Hash survival check\. \(retrievable via headroom_retrieve: aabbccddeeff11223344\)/);
 	});
 
+	it("skips opencode internal agents (title/summary/compaction)", async () => {
+		const { hooks } = ctx;
+		const output = {
+			messages: [
+				{ info: { role: "user", agent: "summary" }, parts: [{ type: "text", text: "summarize this" }] },
+			],
+		} as any;
+		await (hooks as any)["experimental.chat.messages.transform"]({}, output);
+		assert.equal(output.messages[0].parts[0].text, "summarize this", "internal request untouched");
+	});
+
 	it("persists acp ranges to disk and restores them per session", async () => {
 		const { hooks } = ctx;
 		const mk = (id: string) => ({ info: { id, role: "assistant", cost: 0, tokens: { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: `content of ${id}` }] });

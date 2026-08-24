@@ -55,6 +55,9 @@ function isAnthropic(m?: { providerID?: string; api?: { npm?: string } }): boole
 	return m.providerID === "anthropic" || (m.api?.npm ?? "").includes("anthropic");
 }
 
+// opencode built-in hidden agents whose requests must pass through untouched.
+const INTERNAL_AGENTS = new Set(["title", "summary", "compaction"]);
+
 // Per-instance runtime state (one plugin instance per opencode server):
 // real provider-reported usage refreshed each LLM call, plus the active
 // model's context window limit captured from chat.params.
@@ -188,6 +191,14 @@ export const AcpHeadroomPlugin: Plugin = async ({ client }) => {
 		async "experimental.chat.messages.transform"(input, output) {
 			void input;
 			const msgs = output.messages;
+
+			// Skip opencode's internal agents (title/summary/compaction): these
+			// hidden small LLM calls must not be mutated, and letting them write
+			// usage/pressure state would corrupt the main session's stats
+			// (same failure mode as opencode-acp's Bug 37).
+			const lastMsg = msgs[msgs.length - 1];
+			const agentName = (lastMsg?.info as { agent?: unknown } | undefined)?.agent;
+			if (typeof agentName === "string" && INTERNAL_AGENTS.has(agentName)) return;
 
 			// Real provider-reported usage + composition, recomputed fresh each
 			// round (the transform always receives the complete projection).
